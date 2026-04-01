@@ -3,8 +3,6 @@
  * @brief Industrial-grade Command Line Interface (CLI) Framework.
  * Support for AF_UNIX transport, Redis-style parsing, and safe dispatching.
  */
-
-#include "cmd.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,8 +15,11 @@
 #include <sys/time.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include "log.h"
+#include "cmd.h"
 
+static atomic_bool g_server_running = ATOMIC_VAR_INIT(true);
 static const cmd_entry_t *g_table = NULL;
 
 /**
@@ -469,7 +470,10 @@ static void *cmd_server_worker(void *arg) {
 
     log_info("[MGMT] Server thread started. Port: %s\n", SOCKET_PATH);
 
-    while (1) {
+    while (atomic_load(&g_server_running)) {
+
+        pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+
         int cfd = accept(lfd, NULL, NULL);
         if (cfd < 0) {
             if (errno == EINTR) continue;
@@ -477,9 +481,12 @@ static void *cmd_server_worker(void *arg) {
             continue;
         }
 
+        pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+
         /* Set a receive timeout to prevent hung CLI connections from blocking the thread */
         struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
         setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
         afuinx_header_t hdr;
         char *payload = NULL;
@@ -518,7 +525,7 @@ pthread_t cmd_server_start(void *user_ctx) {
     }
 
     args->user_ctx = user_ctx;
-
+    atomic_store(&g_server_running, true);
     /* Create the thread */
     int rc = pthread_create(&tid, NULL, cmd_server_worker, args);
     if (rc != 0) {
@@ -528,7 +535,24 @@ pthread_t cmd_server_start(void *user_ctx) {
     }
 
     /* Detach thread to ensure resources are auto-reclaimed on exit */
-    pthread_detach(tid);
+    // pthread_detach(tid);
     
     return tid;
+}
+
+void cmd_server_stop(pthread_t *tid_ptr) {
+    if (!tid_ptr || *tid_ptr == 0) return;
+
+    /* 告诉线程该收工了 */
+    atomic_store(&g_server_running, false);
+
+    /* 发送取消请求 */
+    pthread_cancel(*tid_ptr);
+
+    /* 阻塞等待线程彻底消失，回收 PCB 资源 */
+    pthread_join(*tid_ptr, NULL);
+
+    /* 句柄清零 */
+    *tid_ptr = 0;
+    log_info("[MGMT] CLI Server stopped.");
 }

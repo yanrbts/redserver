@@ -188,4 +188,6 @@ int cmd_handle_help(void *ctx, int argc, char **argv, cmd_resp_t *resp);
  */
 pthread_t cmd_server_start(void *user_ctx);
 
+void cmd_server_stop(pthread_t *tid_ptr);
+
 #endif
