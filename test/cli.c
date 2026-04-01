@@ -11,14 +11,6 @@
 #include "cmd.h"
 #include "linenoise.h"
 
-// /* ANSI Soft Colors for Linenoise (Wrapped to fix Tab offset) */
-// #define C_CYAN    "\001\033[36m\002"      /* Soft Cyan */
-// #define C_DIM     "\001\033[2m\002"       /* Dim White / Gray */
-// #define C_BOLD    "\001\033[1m\002"       /* Pure White Bold */
-// #define C_GRAY    "\001\033[90m\002"      /* Dark Gray */
-// #define C_RESET   "\001\033[0m\002"       /* Reset all */
-// #define C_GREEN   "\001\033[92m\002"   /* 亮绿色：用于 "Running", "Active", "Normal" */
-
 #define REFLEX_PROMPT   "reflex> " 
 
 /* Sub-command dictionaries for deeper completion */
@@ -177,7 +169,7 @@ int main() {
             }
 
             linenoiseHistoryAdd(line);
-            linenoiseHistorySave(".vfast_history");
+            linenoiseHistorySave("/tmp/reflex_history");
         }
         free(line);
     }
