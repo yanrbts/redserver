@@ -185,9 +185,15 @@ int cmd_handle_help(void *ctx, int argc, char **argv, cmd_resp_t *resp);
  * socket accept loop.
  * @param user_ctx  Pointer to the main application's state/data structure.
  * @return pthread_t The created Thread ID on success, or 0 on failure.
+ * @note: The caller is responsible for calling cmd_server_stop() 
+ * with the returned thread ID to ensure proper cleanup.
  */
 pthread_t cmd_server_start(void *user_ctx);
 
-void cmd_server_stop(pthread_t *tid_ptr);
+/**
+ * @brief Gracefully terminates the CLI server thread.
+ * @param ptid Pointer to the thread ID to be joined and reset.
+ */
+void cmd_server_stop(pthread_t *ptid);
 
 #endif

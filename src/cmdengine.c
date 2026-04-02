@@ -7,6 +7,8 @@
 #include <errno.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <dirent.h>
+#include <unistd.h>
 #include "log.h"
 #include "cmd.h"
 #include "cmdengine.h"
@@ -34,15 +36,18 @@ static cmd_engine_t cmdengine = {
     }
 };
 
+static struct timespec g_start_ts;
+
 static int cmd_set_islogptk(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_get_reass_stats(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_get_config(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_handle_set(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_handle_get(void *ctx, int argc, char **argv, cmd_resp_t *resp);
+static int cmd_handle_status(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 
 static const cmd_entry_t cmd_table[] = {
     /* --- Root Level Commands (group is NULL) --- */
-    {NULL,  "STATUS", "show server status",               "",            1, NULL},
+    {NULL,  "STATUS", "show server status",               "",            1, cmd_handle_status},
     {NULL,  "SET",    "set parameters",                   "<key> <val>", 1, cmd_handle_set},
     {NULL,  "GET",    "get parameters",                   "<key>",       1, cmd_handle_get},
     {NULL,  "HELP",   "command help",                     "[command]",   1, cmd_handle_help},
@@ -56,6 +61,166 @@ static const cmd_entry_t cmd_table[] = {
 
     {NULL, NULL, NULL, NULL, 0, NULL}
 };
+
+static void get_uptime_str(char *buf, size_t len) {
+    struct timespec now_ts;
+    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+
+    long diff = now_ts.tv_sec - g_start_ts.tv_sec;
+    if (diff < 0) diff = 0;
+
+    int days  = (int)(diff / 86400);
+    int hours = (int)((diff % 86400) / 3600);
+    int mins  = (int)((diff % 3600) / 60);
+    int secs  = (int)(diff % 60);
+
+    snprintf(buf, len, "%dd %dh %dm %ds", days, hours, mins, secs);
+}
+
+static int get_thread_count() {
+    FILE *fp = fopen("/proc/self/status", "r");
+    if (!fp) return -1;
+
+    char line[256];
+    int threads = -1;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "Threads:", 8) == 0) {
+            char *p = line + 8;
+            while (*p && (*p < '0' || *p > '9')) p++;
+            if (*p) threads = atoi(p);
+            break;
+        }
+    }
+    fclose(fp);
+    return threads;
+}
+
+static int get_fd_count() {
+    DIR *dir = opendir("/proc/self/fd");
+    if (!dir) return -1;
+
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] != '.') {
+            count++;
+        }
+    }
+    closedir(dir);
+    
+    /**
+     * Note: The count includes the directory stream itself, so we subtract 1 
+     * to get the actual number of open file descriptors.
+     * This is a common practice when counting entries in /proc/self/fd, 
+     * as the directory stream is an open file descriptor 
+     * that we don't want to include in the count of active FDs
+     */
+    return (count > 0) ? (count - 1) : 0;
+}
+
+typedef struct {
+    unsigned long utime;
+    unsigned long stime;
+    unsigned long long total_system_time;
+} cpu_occupy_t;
+
+/**
+ * @brief Helper to get cumulative CPU ticks for the process and the system.
+ */
+static int get_cpu_ticks_sample(unsigned long *utime, unsigned long *stime, unsigned long long *system_total) {
+    // 1. Get process ticks from /proc/self/stat
+    FILE *fp = fopen("/proc/self/stat", "r");
+    if (!fp) return -1;
+    char buf[1024];
+    if (!fgets(buf, sizeof(buf), fp)) { fclose(fp); return -1; }
+    fclose(fp);
+
+    /* Robust parsing: Find the last ')' to skip the comm (process name) field 
+     * because process names can contain spaces or brackets. */
+    char *q = strrchr(buf, ')');
+    if (!q || sscanf(q + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", utime, stime) != 2) {
+        return -1;
+    }
+
+    // 2. Get global system ticks from /proc/stat (Sum of all CPU states)
+    fp = fopen("/proc/stat", "r");
+    if (!fp) return -1;
+    if (!fgets(buf, sizeof(buf), fp)) { fclose(fp); return -1; }
+    fclose(fp);
+
+    unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
+    if (sscanf(buf, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", 
+               &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal) < 4) {
+        return -1;
+    }
+    *system_total = user + nice + system + idle + iowait + irq + softirq + steal;
+
+    return 0;
+}
+
+/**
+ * @brief Industrial-grade CPU usage calculation (Instantaneous Ratio).
+ * Samples twice with a short delay to calculate the real-time load.
+ * @return CPU usage percentage (e.g., 12.5 for 12.5%), or 0.0 on error.
+ */
+static double get_cpu_usage_ratio(void) {
+    cpu_occupy_t s1, s2;
+
+    /* Sample 1 */
+    if (get_cpu_ticks_sample(&s1.utime, &s1.stime, &s1.total_system_time) < 0) {
+        return 0.0;
+    }
+
+    /* Industrial standard interval (100ms - 200ms) */
+    usleep(100000); 
+
+    /* Sample 2 */
+    if (get_cpu_ticks_sample(&s2.utime, &s2.stime, &s2.total_system_time) < 0) {
+        return 0.0;
+    }
+
+    /* Calculate Deltas */
+    unsigned long process_delta = (s2.utime + s2.stime) - (s1.utime + s1.stime);
+    unsigned long long system_delta = s2.total_system_time - s1.total_system_time;
+
+    if (system_delta == 0) return 0.0;
+
+    /* Calculation: (Process Ticks / Total System Ticks) * 100 
+     * This represents the percentage of total CPU resources used. */
+    double usage = ((double)process_delta / (double)system_delta) * 100.0;
+
+    /* Optional: Scale by number of cores if you want "Per-Core" equivalent, 
+     * but usually Total System usage is what CLI status needs. */
+    return usage;
+}
+
+static long get_memory_vm_rss_kb(void) {
+    FILE *fp = fopen("/proc/self/status", "r");
+    if (!fp) {
+        return -1;
+    }
+
+    char buf[256];
+    long rss_kb = -1;
+
+    while (fgets(buf, sizeof(buf), fp)) {
+        char *match = strstr(buf, "VmRSS:");
+        if (match) {
+            char *ptr = match + 6;
+            while (*ptr && (*ptr < '0' || *ptr > '9')) {
+                ptr++;
+            }
+
+            if (*ptr >= '0' && *ptr <= '9') {
+                rss_kb = atol(ptr);
+            }
+            break; 
+        }
+    }
+
+    fclose(fp);
+    return rss_kb;
+}
 
 /**
  * @brief Professional Handler for 'SET logpkt' using C11 Atomic Operations.
@@ -308,12 +473,40 @@ static int cmd_get_config(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
     return 0;
 }
 
+static int cmd_handle_status(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
+    (void)ctx;
+    (void)argv;
+
+    if (argc != 1) {
+        cmd_resp_red(resp, "ERR: Unexpected arguments. Usage: STATUS");
+        return 0;
+    }
+
+    char uptime_str[64];
+    get_uptime_str(uptime_str, sizeof(uptime_str));
+
+    int thread_count = get_thread_count();
+    int fd_count = get_fd_count();
+    double cpu_usage = get_cpu_usage_ratio();
+    long mem_rss_kb = get_memory_vm_rss_kb();
+
+    cmd_resp_printf(resp, "\n%s%-20s%s : %s%d%s\n", C_GREEN, "PID", C_RESET, C_YELLOW, getpid(), C_RESET);
+    cmd_resp_printf(resp, "%s%-20s%s : %s%s%s\n", C_GREEN, "Uptime", C_RESET, C_YELLOW, uptime_str, C_RESET);
+    cmd_resp_printf(resp, "%s%-20s%s : %s%d%s\n", C_GREEN, "Threads", C_RESET, C_YELLOW, thread_count, C_RESET);
+    cmd_resp_printf(resp, "%s%-20s%s : %s%d%s\n", C_GREEN, "Open FDs", C_RESET, C_YELLOW, fd_count, C_RESET);
+    cmd_resp_printf(resp, "%s%-20s%s : %s%.2f CPU-seconds%s\n", C_GREEN, "CPU Usage", C_RESET, C_YELLOW, cpu_usage, C_RESET);
+    cmd_resp_printf(resp, "%s%-20s%s : %s%ld KB%s\n", C_GREEN, "Memory RSS", C_RESET, C_YELLOW, mem_rss_kb, C_RESET);
+
+    return 0;
+}
+
 /**
  * @brief Initializes the command table and launches the management server thread.
  * @return pthread_t The thread ID of the management server on success, 
  * or 0 if the table registration or thread creation fails.
  */
 pthread_t cmd_start_core(void) {
+    clock_gettime(CLOCK_MONOTONIC, &g_start_ts);
     /* 1. Register the business command table */
     cmd_register_table(cmd_table);
 

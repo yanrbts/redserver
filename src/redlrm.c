@@ -40,6 +40,7 @@
 #include "xdp_receiver.h"
 #include "pkteng.h"
 #include "af_unix.h"
+#include "cmd.h"
 #include "cmdengine.h"
 
 /* Global atomic flag */
@@ -434,7 +435,6 @@ static void init_server(void) {
     );
 
     xdp_reasm_init();
-
     gap_assemble_init();
 
     redserver.tm = tm_create(4);
@@ -584,6 +584,7 @@ void server_cleanup() {
     tm_destroy(redserver.tm);
     gap_assemble_destroy();
     xdp_reasm_show_stats();
+    cmd_server_stop(&redserver.cmd_tid);
     
     log_info("Memory cleaned up successfully");
 }

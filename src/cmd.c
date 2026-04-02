@@ -360,7 +360,6 @@ int cmd_group_help(const char *group, cmd_resp_t *resp) {
 
     /* --- Header Section --- */
     if (group) {
-        // cmd_resp_printf(resp, "\n%s[ Group: %s ]%s\n", C_GRAY, group, C_RESET);
         /* Header ensures the alignment baseline is clear for group-specific help */
         cmd_resp_printf(resp, "\n"C_GRAY "%-*s %-*s %s [ Group: %s ]" C_RESET "\n\n", 
                         COL1_WIDTH, "SUB-COMMAND", COL2_WIDTH, "DESCRIPTION", "USAGE", group);
@@ -476,9 +475,24 @@ static void *cmd_server_worker(void *arg) {
 
         int cfd = accept(lfd, NULL, NULL);
         if (cfd < 0) {
-            if (errno == EINTR) continue;
-            log_error("[MGMT] Accept error");
-            continue;
+            /* Case 1: Interrupted by a signal (e.g., SIGUSR1 for wake-up). 
+             * Just restart the system call to keep the loop alive. */
+            if (errno == EINTR) {
+                continue;
+            }
+
+            /* Case 2: Process/System-wide file descriptor limit reached.
+             * Instead of crashing, wait 1s for other tasks to release handles. */
+            if (errno == EMFILE || errno == ENFILE) {
+                log_error("[MGMT] Accept failed: Out of file descriptors. Retrying...");
+                sleep(1); 
+                continue;
+            }
+
+            /* Case 3: Fatal error (e.g., EBADF - lfd is invalid/closed).
+             * Unrecoverable state; terminate the thread to prevent log flooding. */
+            log_error("[MGMT] Accept fatal error: %s. Thread exiting...", strerror(errno));
+            break;
         }
 
         pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
@@ -533,26 +547,31 @@ pthread_t cmd_server_start(void *user_ctx) {
         free(args);
         return 0;
     }
-
-    /* Detach thread to ensure resources are auto-reclaimed on exit */
-    // pthread_detach(tid);
     
     return tid;
 }
 
-void cmd_server_stop(pthread_t *tid_ptr) {
-    if (!tid_ptr || *tid_ptr == 0) return;
+/**
+ * @brief Gracefully terminates the CLI server thread.
+ * @param ptid Pointer to the thread ID to be joined and reset.
+ */
+void cmd_server_stop(pthread_t *ptid) {
+    /* Step 1: Defensive check. Do nothing if the pointer is NULL or thread is already stopped. */
+    if (!ptid || *ptid == 0) {
+        return;
+    }
 
-    /* 告诉线程该收工了 */
+    /* Step 2: Signal the worker thread to exit its main loop via an atomic flag. */
     atomic_store(&g_server_running, false);
 
-    /* 发送取消请求 */
-    pthread_cancel(*tid_ptr);
+    /* Step 3: Send a cancellation request to the thread. 
+     * This forces the thread to wake up from blocking calls like accept(). */
+    pthread_cancel(*ptid);
 
-    /* 阻塞等待线程彻底消失，回收 PCB 资源 */
-    pthread_join(*tid_ptr, NULL);
+    /* Step 4: Block until the thread terminates to reclaim its resources (stack, TCB). 
+     * This prevents "zombie threads" from leaking system memory. */
+    pthread_join(*ptid, NULL);
+    *ptid = 0;
 
-    /* 句柄清零 */
-    *tid_ptr = 0;
-    log_info("[MGMT] CLI Server stopped.");
+    log_info("[MGMT] CLI Server stopped gracefully and resources reclaimed.");
 }
