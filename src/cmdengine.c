@@ -16,6 +16,7 @@
 typedef struct cmd_engine_s {
     atomic_int interval;       /* Atomic integer for scan interval */
     atomic_bool islogptk;      /* Atomic boolean for packet logging */
+    atomic_bool isdebug;       /* Atomic boolean for debug mode */
 
     struct {
         atomic_uint_least64_t completed; /* Successfully reassembled datagrams */
@@ -28,6 +29,7 @@ typedef struct cmd_engine_s {
 static cmd_engine_t cmdengine = {
     .interval = ATOMIC_VAR_INIT(1000),  /* Default 1000ms */
     .islogptk = ATOMIC_VAR_INIT(false), /* Default disabled */
+    .isdebug = ATOMIC_VAR_INIT(true),  /* Default enabled */
     .reass_stats = {
         .completed = ATOMIC_VAR_INIT(0),
         .timeout = ATOMIC_VAR_INIT(0),
@@ -39,6 +41,7 @@ static cmd_engine_t cmdengine = {
 static struct timespec g_start_ts;
 
 static int cmd_set_islogptk(void *ctx, int argc, char **argv, cmd_resp_t *resp);
+static int cmd_set_isdebug(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_get_reass_stats(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_get_config(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_handle_set(void *ctx, int argc, char **argv, cmd_resp_t *resp);
@@ -55,6 +58,7 @@ static const cmd_entry_t cmd_table[] = {
     /* --- SET Group Sub-commands --- */
     {"SET", "interval", "Scan interval (ms)",              "<val>",      3, NULL},
     {"SET", "logpkt",   "print raw XDP packet info",       "<1|0>",      3, cmd_set_islogptk},
+    {"SET", "debug",    "enable/disable debug mode",       "<1|0>",     3, cmd_set_isdebug},
     /* --- GET Group Sub-commands --- */
     {"GET", "pktstats", "get packet statistics",           "",           2, cmd_get_reass_stats},
     {"GET", "config",   "get configuration",               "",           2, cmd_get_config},
@@ -286,6 +290,52 @@ static int cmd_set_islogptk(void *ctx, int argc, char **argv, cmd_resp_t *resp) 
     return 0;
 }
 
+static int cmd_set_isdebug(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
+    /* Similar structure to cmd_set_islogptk, but for the isdebug flag */
+    cmd_engine_t *engine = (cmd_engine_t *)ctx;
+    if (!engine) {
+        cmd_resp_red(resp, "ERR: System internal error: context is NULL.");
+        return -1;
+    }
+
+    if (argc < 3 || argv[2] == NULL) {
+        cmd_resp_red(resp, "ERR: Missing parameter. Usage: SET debug <1|0|on|off>");
+        return 0;
+    }
+
+    const char *val_str = argv[2];
+    bool enable;
+
+    if (strcmp(val_str, "1") == 0 || 
+        strcasecmp(val_str, "on") == 0 || 
+        strcasecmp(val_str, "true") == 0) {
+        enable = true;
+    } else if (strcmp(val_str, "0") == 0 || 
+               strcasecmp(val_str, "off") == 0 || 
+               strcasecmp(val_str, "false") == 0) {
+        enable = false;
+    } else {
+        cmd_resp_red(resp, "ERR: Invalid value '%s'. Expected: 1, 0, on, off, true, or false.", val_str);
+        return 0; 
+    }
+
+    if (atomic_load(&engine->isdebug) == enable) {
+        cmd_resp_green(resp, "OK: Debug mode is already %s.", enable ? "ENABLED" : "DISABLED");
+        return 0;
+    }
+
+    atomic_store(&engine->isdebug, enable);
+    if (enable) 
+        log_set_level(LOG_TRACE);
+    else 
+        log_set_level(LOG_INFO);
+
+    cmd_resp_green(resp, "OK: Debug mode changed to %s.", enable ? "ENABLED" : "DISABLED");
+    log_info("[MGMT] Configuration updated: isdebug set to %d by administrator.", (int)enable);
+
+    return 0;
+}
+
 /**
  * @brief Sub-dispatcher for the "SET" group.
  */
@@ -470,6 +520,11 @@ static int cmd_get_config(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
                     C_YELLOW, islogptk ? "yes" : "no",
                     C_RESET);
 
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%s%s\n", 
+                    C_GREEN, "debug", C_RESET, 
+                    C_YELLOW, cmd_isdebug_enabled() ? "yes" : "no",
+                    C_RESET);
+
     return 0;
 }
 
@@ -526,6 +581,10 @@ pthread_t cmd_start_core(void) {
 
 bool cmd_islogpkt_enabled(void) {
     return atomic_load(&cmdengine.islogptk);
+}
+
+bool cmd_isdebug_enabled(void) {
+    return atomic_load(&cmdengine.isdebug);
 }
 
 /**
