@@ -17,9 +17,10 @@
 6. [util.h - 工具函数接口](#util-h)
 7. [gap.h - 隧道数据包接口](#gap-h)
 8. [xdp/xdp_pkt_parser.h - 数据包解析接口](#xdp-pkt-parser-h)
-9. [af_unix.h - Unix域服务器接口](#af-unix-h)
-10. [pkteng.h - 数据包引擎接口](#pkteng-h)
-11. [session_manager.h - 会话管理接口](#session-manager-h)
+9. [cmd.h - 命令框架接口](#cmd-h)
+10. [af_unix.h - Unix域服务器接口](#af-unix-h)
+11. [pkteng.h - 数据包引擎接口](#pkteng-h)
+12. [session_manager.h - 会话管理接口](#session-manager-h)
 
 ---
 
@@ -1412,6 +1413,505 @@ static inline size_t get_gap_packet_total_size(const void *payload_ptr);
 - 成功: 总大小（字节）
 - 失败: 0
 
+#### gap_build_tunneled_packets_ex
+**功能**: 从原始数据缓冲区构建一个或多个隧道数据包
+
+**语法**:
+```c
+int gap_build_tunneled_packets_ex(
+    const uint8_t *data, size_t len,
+    const uint8_t *src_mac, const uint8_t *dst_mac,
+    uint32_t src_ip_nbo, uint32_t dst_ip_nbo,
+    uint16_t src_port, uint16_t dst_port,
+    uint32_t auth,
+    tunnel_payload_t ***payloads_out, size_t *num_payloads
+);
+```
+
+**参数**:
+- `data`: 源缓冲区指针（包含内层头+载荷）
+- `len`: 源缓冲区总长度
+- `src_mac`: 伪造以太网头的源MAC地址（6字节）
+- `dst_mac`: 伪造以太网头的目标MAC地址（6字节）
+- `src_ip_nbo`: 源IPv4地址（网络字节序）
+- `dst_ip_nbo`: 目标IPv4地址（网络字节序）
+- `src_port`: 伪造源UDP端口（主机序）
+- `dst_port`: 伪造目标UDP端口（主机序）
+- `auth`: 32位认证值
+- `payloads_out`: 输出：分配的tunnel_payload_t指针数组
+- `num_payloads`: 输出：生成的分片总数
+
+**返回值**:
+- 成功: 0
+- 失败: -1
+
+**说明**: 
+- 如果数据大小超过GAP_MAX_FRAGMENT，会分割为多个分片
+- 调用者必须通过gap_free_tunneled_packets()释放
+
+#### gap_build_ctrl54_packet
+**功能**: 构建raise数据包（仅包含伪造以太网头和认证字段）
+
+**语法**:
+```c
+tunnel_payload_t* gap_build_ctrl54_packet(
+    const uint8_t *real_data, size_t real_len,
+    const uint8_t *src_mac, const uint8_t *dst_mac,
+    uint32_t src_ip_nbo, uint32_t dst_ip_nbo,
+    uint16_t src_port, uint16_t dst_port,
+    uint32_t auth, size_t *packet_len
+);
+```
+
+**参数**:
+- `real_data`: 真实载荷数据指针（如JSON）
+- `real_len`: 真实载荷长度
+- `src_mac`: 要伪造的源MAC地址（6字节）
+- `dst_mac`: 目标MAC地址（6字节）
+- `src_ip_nbo`: 源IPv4（4字节，网络字节序）
+- `dst_ip_nbo`: 目标IPv4（4字节，网络字节序）
+- `src_port`: 伪造源UDP端口（主机序）
+- `dst_port`: 伪造目标UDP端口（主机序）
+- `auth`: 认证字段（4字节）
+- `packet_len`: 输出：返回数据包的总长度
+
+**返回值**:
+- 成功: 分配的数据包缓冲区指针
+- 失败: NULL
+
+**警告**: 调用者必须使用gap_free_single_payload()释放返回的指针
+
+#### gap_get_inner
+**功能**: 获取隧道数据包的内部载荷指针
+
+**语法**:
+```c
+static inline tunnel_inner_payload_t* gap_get_inner(const uint8_t *payload, size_t len);
+```
+
+**参数**:
+- `payload`: 原始载荷数据指针
+- `len`: 载荷缓冲区长度
+
+**返回值**:
+- 成功: tunnel_inner_payload_t指针
+- 失败: NULL（数据不足或参数无效）
+
+#### gap_free_single_payload
+**功能**: 安全释放单个隧道数据包
+
+**语法**:
+```c
+static inline void gap_free_single_payload(tunnel_payload_t *pkt);
+```
+
+**参数**:
+- `pkt`: 要释放的tunnel_payload_t数据包指针
+
+**返回值**: 无
+
+#### gap_assemble_init
+**功能**: 初始化分片重组的全局内存池
+
+**语法**:
+```c
+int gap_assemble_init(void);
+```
+
+**参数**: 无
+
+**返回值**:
+- 成功: 0
+- 失败: -1（分配失败）
+
+#### gap_assemble_destroy
+**功能**: 释放全局内存池
+
+**语法**:
+```c
+void gap_assemble_destroy(void);
+```
+
+**参数**: 无
+
+**返回值**: 无
+
+**说明**: 应在应用程序关闭时调用（如SIGTERM处理器），防止内存泄漏
+
+#### gap_assemble_tunnel_payload
+**功能**: 将隧道分片重组为完整的JSON缓冲区
+
+**语法**:
+```c
+uint8_t* gap_assemble_tunnel_payload(const tunnel_inner_payload_t *frag, size_t *out_full_size);
+```
+
+**参数**:
+- `frag`: 传入的分片结构指针
+- `out_full_size`: 输出参数，存储组装后的总长度
+
+**返回值**:
+- 成功: 分配的完整缓冲区指针（调用者必须free）
+- 失败: NULL
+
+#### gap_assemble_free_packet
+**功能**: 释放由gap_assemble_tunnel_payload返回的缓冲区
+
+**语法**:
+```c
+void gap_assemble_free_packet(uint8_t *complete_pkt);
+```
+
+**参数**:
+- `complete_pkt`: gap_assemble_tunnel_payload返回的指针
+
+**返回值**: 无
+
+**说明**: 上层逻辑处理完重组数据后调用
+
+#### gap_assemble_cleanup
+**功能**: 定期扫描并清理过期的重组会话
+
+**语法**:
+```c
+void gap_assemble_cleanup(void *user_data);
+```
+
+**参数**:
+- `user_data`: 用户数据指针（未使用）
+
+**返回值**: 无
+
+**说明**: 应由定时器或主循环调用，防止僵尸会话占用内存池
+
+---
+
+<a name="cmd-h"></a>
+## cmd.h - 命令框架接口
+
+### 概述
+命令框架模块提供基于AF_UNIX套接字的管理CLI服务。支持Redis风格的命令解析、注册表绑定、彩色终端输出和后台服务器线程管理。
+
+### 常量定义
+```c
+#define AFUINX_MAGIC    0x56465354    // 协议魔数
+#define MAX_ARG_COUNT   16            // 最大参数数量
+#define MAX_RESP_BUF    4096          // 最大响应缓冲区大小
+#define AFUINX_VERSION  1             // 协议版本
+#define SOCKET_PATH     "/tmp/vfast.sock"  // 默认套接字路径
+```
+
+### 颜色输出常量
+```c
+#define C_DIM     "\001\033[2m\002"      // 暗色
+#define C_BOLD    "\001\033[1m\002"      // 粗体
+#define C_GRAY    "\001\033[90m\002"     // 灰色
+#define C_YELLOW  "\001\033[1;33m\002"   // 黄色
+#define C_RESET   "\001\033[0m\002"      // 重置
+#define C_GREEN   "\001\033[92m\002"     // 绿色（运行/正常）
+#define C_BLUE    "\001\033[94m\002"     // 蓝色（信息）
+#define C_MAGENTA "\001\033[95m\002"     // 洋红（配置）
+#define C_CYAN    "\001\033[96m\002"     // 青色（指标）
+#define C_RED     "\001\033[91m\002"     // 红色（错误）
+#define C_ORANGE  "\001\033[38;5;208m\002" // 橙色（警告）
+```
+
+### 数据结构
+
+#### afuinx_header_t
+工业标准协议头结构
+```c
+typedef struct {
+    uint32_t magic;      // 魔数
+    uint16_t type;       // 消息类型
+    uint16_t version;    // 版本号
+    uint32_t length;     // 载荷长度
+} __attribute__((packed)) afuinx_header_t;
+```
+
+#### cmd_resp_t
+响应缓冲区包装结构（防止字符串连接时溢出）
+```c
+typedef struct {
+    char *buf;           // 缓冲区指针
+    size_t size;         // 缓冲区总大小
+    size_t offset;       // 当前写入偏移
+} cmd_resp_t;
+```
+
+#### cmd_handler_t
+专业命令处理器签名
+```c
+typedef int (*cmd_handler_t)(void *ctx, int argc, char **argv, cmd_resp_t *resp);
+```
+
+#### cmd_entry_t
+命令注册表条目
+```c
+typedef struct {
+    const char *group;      // 命令组名
+    const char *name;       // 命令名称
+    const char *help;      // 帮助文本
+    const char *usage;     // 使用说明
+    int min_argc;           // 最小参数数量
+    cmd_handler_t handler;  // 处理函数
+} cmd_entry_t;
+```
+
+### 函数接口
+
+#### cmd_transport_listen
+**功能**: 初始化并绑定AF_UNIX流套接字进行管理监听
+
+**语法**:
+```c
+int cmd_transport_listen(const char *path);
+```
+
+**参数**:
+- `path`: AF_UNIX套接字的文件系统路径
+
+**返回值**:
+- 成功: 监听套接字文件描述符
+- 失败: -1
+
+**说明**: 
+- 清理已存在的套接字文件
+- 创建并绑定套接字
+- 开始监听传入连接
+
+#### cmd_transport_connect
+**功能**: 通过AF_UNIX套接字连接到远程管理服务器
+
+**语法**:
+```c
+int cmd_transport_connect(const char *path);
+```
+
+**参数**:
+- `path`: 服务器套接字的路径
+
+**返回值**:
+- 成功: 已连接套接字文件描述符
+- 失败: -1
+
+#### cmd_transport_recv
+**功能**: 从对等端接收协议数据包
+
+**语法**:
+```c
+int cmd_transport_recv(int fd, afuinx_header_t *hdr, char **payload);
+```
+
+**参数**:
+- `fd`: 已连接套接字描述符
+- `hdr`: 要填充的头结构指针
+- `payload`: 输出参数，指向堆分配缓冲区的指针（调用者负责free）
+
+**返回值**:
+- 成功: 0
+- 失败: -1（协议错误或连接断开）
+
+**说明**: 
+- 先读取固定大小头确定载荷大小
+- 分配内存读取载荷
+- 包含超时保护和缓冲区溢出保护
+
+#### cmd_transport_send
+**功能**: 使用VFast封装协议发送数据
+
+**语法**:
+```c
+int cmd_transport_send(int fd, uint16_t type, const char *data, uint32_t len);
+```
+
+**参数**:
+- `fd`: 已连接套接字描述符
+- `type`: 协议消息类型
+- `data`: 载荷数据指针
+- `len`: 载荷长度（字节）
+
+**返回值**:
+- 成功: 0
+- 失败: -1
+
+**说明**: 使用MSG_NOSIGNAL防止管道破裂时进程终止
+
+#### cmd_dispatch
+**功能**: 将原始输入字符串分派到对应业务处理器
+
+**语法**:
+```c
+int cmd_dispatch(void *ctx, char *input, char *output, size_t max_len);
+```
+
+**参数**:
+- `ctx`: 用户定义的上下文（引擎对象指针）
+- `input`: 原始null结尾命令字符串
+- `output`: 存储响应的输出缓冲区指针
+- `max_len`: 输出缓冲区大小
+
+**返回值**:
+- 成功: 处理器返回码
+- 失败: -1（命令未知或格式错误）
+
+**说明**: 
+- 执行参数标记化（Redis风格）
+- 命令表查找
+- 参数数量验证
+- 执行关联回调函数
+
+#### cmd_register_table
+**功能**: 绑定静态命令注册表到框架内部调度器
+
+**语法**:
+```c
+void cmd_register_table(const cmd_entry_t *table);
+```
+
+**参数**:
+- `table`: NULL结尾的cmd_entry_t数组指针
+
+**返回值**: 无
+
+#### cmd_resp_printf
+**功能**: 线程安全的格式化打印到响应上下文
+
+**语法**:
+```c
+void cmd_resp_printf(cmd_resp_t *r, const char *fmt, ...);
+```
+
+**参数**:
+- `r`: 命令响应上下文指针
+- `fmt`: printf风格格式字符串
+- `...`: 可变参数
+
+**返回值**: 无
+
+**说明**: 追加格式化文本到内部响应缓冲区，确保不超过缓冲区容量
+
+#### cmd_resp_red
+**功能**: 错误消息输出（红色）
+
+**语法**:
+```c
+void cmd_resp_red(cmd_resp_t *r, const char *fmt, ...);
+```
+
+**参数**:
+- `r`: 命令响应上下文指针
+- `fmt`: printf风格格式字符串
+- `...`: 可变参数
+
+**返回值**: 无
+
+**说明**: 使用ANSI转义码生成红色输出，确保颜色代码不干扰缓冲区限制
+
+#### cmd_resp_green
+**功能**: 成功消息输出（绿色）
+
+**语法**:
+```c
+void cmd_resp_green(cmd_resp_t *r, const char *fmt, ...);
+```
+
+**参数**:
+- `r`: 命令响应上下文指针
+- `fmt`: printf风格格式字符串
+- `...`: 可变参数
+
+**返回值**: 无
+
+**说明**: 与cmd_resp_red类似，使用绿色表示正向状态
+
+#### cmd_resp_cyan
+**功能**: 信息消息输出（青色）
+
+**语法**:
+```c
+void cmd_resp_cyan(cmd_resp_t *r, const char *fmt, ...);
+```
+
+**参数**:
+- `r`: 命令响应上下文指针
+- `fmt`: printf风格格式字符串
+- `...`: 可变参数
+
+**返回值**: 无
+
+**说明**: 使用青色区分信息输出与错误和成功消息
+
+#### cmd_group_help
+**功能**: 生成特定命令组的格式化帮助消息
+
+**语法**:
+```c
+int cmd_group_help(const char *group, cmd_resp_t *resp);
+```
+
+**参数**:
+- `group`: 组名过滤器（NULL显示根命令）
+- `resp`: 响应上下文指针
+
+**返回值**:
+- 成功: 0
+- 失败: -1
+
+#### cmd_handle_help
+**功能**: HELP命令的标准处理器
+
+**语法**:
+```c
+int cmd_handle_help(void *ctx, int argc, char **argv, cmd_resp_t *resp);
+```
+
+**参数**:
+- `ctx`: 用户上下文
+- `argc`: 参数数量
+- `argv`: 参数向量
+- `resp`: 响应上下文
+
+**返回值**: 处理器返回码
+
+**说明**: 支持通用帮助(HELP)和分组帮助(HELP \<group\>)
+
+#### cmd_server_start
+**功能**: 启动后台管理线程处理CLI请求
+
+**语法**:
+```c
+pthread_t cmd_server_start(void *user_ctx);
+```
+
+**参数**:
+- `user_ctx`: 主应用程序状态/数据结构指针
+
+**返回值**:
+- 成功: 创建的线程ID
+- 失败: 0
+
+**说明**: 
+- "即发即忘"函数
+- 在堆上分配线程参数
+- 创建分离态pthread
+- 启动套接字接受循环
+
+**注意**: 调用者负责使用cmd_server_stop()清理
+
+#### cmd_server_stop
+**功能**: 优雅终止CLI服务器线程
+
+**语法**:
+```c
+void cmd_server_stop(pthread_t *ptid);
+```
+
+**参数**:
+- `ptid`: 要加入并重置的线程ID指针
+
+**返回值**: 无
+
 ---
 
 <a name="af-unix-h"></a>
@@ -1582,6 +2082,57 @@ bool pkt_reverse_raise_to_red(const pkt_info_t *info);
 - 成功: true
 - 失败: false
 
+#### pkt_send_raise_to_black
+**功能**: 发送raise消息到黑区
+
+**语法**:
+```c
+bool pkt_send_raise_to_black(const pkt_info_t *info);
+```
+
+**参数**:
+- `info`: 解析后的raise消息信息
+
+**返回值**:
+- 成功: true
+- 失败: false
+
+**说明**: 处理需要升级到红区的关键警报或状态变更
+
+#### pkt_send_ctrl54_to_black
+**功能**: 发送CTRL54类型控制数据包到黑区
+
+**语法**:
+```c
+bool pkt_send_ctrl54_to_black(const pkt_info_t *info);
+```
+
+**参数**:
+- `info`: 解析后的CTRL54数据包信息
+
+**返回值**:
+- 成功: true
+- 失败: false
+
+**说明**: 处理CTRL54类型的控制命令或警报消息
+
+#### pkt_reverse_ctrl54_to_red
+**功能**: 处理从黑区接收的CTRL54控制数据包
+
+**语法**:
+```c
+bool pkt_reverse_ctrl54_to_red(const pkt_info_t *info);
+```
+
+**参数**:
+- `info`: 解析后的CTRL54数据包信息
+
+**返回值**:
+- 成功: true
+- 失败: false
+
+**说明**: 解封装并路由CTRL54类型的控制响应消息
+
 #### pkt_set_object
 **功能**: 配置数据包引擎的系统对象
 
@@ -1592,6 +2143,7 @@ void pkt_set_object(
     auth_t *const auth,                
     gc_probe_processor_t *const gp,    
     udp_conn_t *const conn,            
+    raw_sock_t *const rawsock,
     const uint16_t port,                
     const uint32_t localip,
     const uint8_t *const localmac
@@ -1603,6 +2155,7 @@ void pkt_set_object(
 - `auth`: 认证服务指针
 - `gp`: GC探测处理器指针
 - `conn`: 共享UDP连接句柄指针
+- `rawsock`: 原始套接字指针
 - `port`: 目标隧道端口
 - `localip`: 用于封装的静态本地IP
 - `localmac`: 6字节源MAC地址指针
