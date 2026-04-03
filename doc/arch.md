@@ -49,8 +49,8 @@
 
 - **Session Storage**：`hash<session_key, Ethernet Header>`（保存源/目标 MAC、IP、端口等）  
 - **Fragment Buffer**：`pool`（用于响应组包）  
-- **Auth Header**：请求分片时追加的认证结构（Magic、Version、Session ID 等）
-## Auth 头结构体示意图
+- **Auth Header**：请求时追加的认证结构（Auth头, 红/黑ip 红/黑mac 等）
+### Auth 头结构体示意图
 
 ```text
 +================================================================================+

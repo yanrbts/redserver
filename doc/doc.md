@@ -2188,6 +2188,9 @@ typedef struct {
     uint32_t src_ip;        // 红区原始源IP地址
     uint16_t src_port;     // 红区原始源端口
     uint8_t  src_mac[6];   // 红区原始源MAC地址
+    uint32_t dst_ip;        // 红区原始目标IP地址
+    uint16_t dst_port;     // 红区原始目标端口
+    uint8_t  dst_mac[6];   // 红区原始目标MAC地址
     uint64_t last_seen;    // 最后活动时间（毫秒）
 } session_context_t;
 ```
