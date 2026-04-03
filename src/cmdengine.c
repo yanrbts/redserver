@@ -58,7 +58,7 @@ static const cmd_entry_t cmd_table[] = {
     /* --- SET Group Sub-commands --- */
     {"SET", "interval", "Scan interval (ms)",              "<val>",      3, NULL},
     {"SET", "logpkt",   "print raw XDP packet info",       "<1|0>",      3, cmd_set_islogptk},
-    {"SET", "debug",    "enable/disable debug mode",       "<1|0>",     3, cmd_set_isdebug},
+    {"SET", "debug",    "enable/disable debug mode",       "<1|0>",      3, cmd_set_isdebug},
     /* --- GET Group Sub-commands --- */
     {"GET", "pktstats", "get packet statistics",           "",           2, cmd_get_reass_stats},
     {"GET", "config",   "get configuration",               "",           2, cmd_get_config},
@@ -486,10 +486,10 @@ static int cmd_get_reass_stats(void *ctx, int argc, char **argv, cmd_resp_t *res
      * Using headers and aligned columns makes the CLI output parseable by 
      * humans and simple scripts.
      */
-    cmd_resp_printf(resp, "\n%s%-20s%s : %s%lu%s\n", C_GREEN, "Reass-Completed", C_RESET, C_YELLOW, completed, C_RESET);
-    cmd_resp_printf(resp, "%s%-20s%s : %s%lu%s\n", C_GREEN, "Reass-Timeout", C_RESET, C_YELLOW, timeout, C_RESET);
-    cmd_resp_printf(resp, "%s%-20s%s : %s%lu%s\n", C_GREEN, "Reass-Error", C_RESET, C_YELLOW, error, C_RESET);
-    cmd_resp_printf(resp, "%s%-20s%s : %s%lu%s\n", C_GREEN, "Reass-Overlap", C_RESET, C_YELLOW, overlap, C_RESET);
+    cmd_resp_printf(resp, "\n  %s%-20s%s : %s%lu%s\n", C_GREEN, "Reass-Completed", C_RESET, C_YELLOW, completed, C_RESET);
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%lu%s\n", C_GREEN, "Reass-Timeout", C_RESET, C_YELLOW, timeout, C_RESET);
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%lu%s\n", C_GREEN, "Reass-Error", C_RESET, C_YELLOW, error, C_RESET);
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%lu%s\n", C_GREEN, "Reass-Overlap", C_RESET, C_YELLOW, overlap, C_RESET);
 
     return 0;
 }
@@ -545,12 +545,12 @@ static int cmd_handle_status(void *ctx, int argc, char **argv, cmd_resp_t *resp)
     double cpu_usage = get_cpu_usage_ratio();
     long mem_rss_kb = get_memory_vm_rss_kb();
 
-    cmd_resp_printf(resp, "\n%s%-20s%s : %s%d%s\n", C_GREEN, "PID", C_RESET, C_YELLOW, getpid(), C_RESET);
-    cmd_resp_printf(resp, "%s%-20s%s : %s%s%s\n", C_GREEN, "Uptime", C_RESET, C_YELLOW, uptime_str, C_RESET);
-    cmd_resp_printf(resp, "%s%-20s%s : %s%d%s\n", C_GREEN, "Threads", C_RESET, C_YELLOW, thread_count, C_RESET);
-    cmd_resp_printf(resp, "%s%-20s%s : %s%d%s\n", C_GREEN, "Open FDs", C_RESET, C_YELLOW, fd_count, C_RESET);
-    cmd_resp_printf(resp, "%s%-20s%s : %s%.2f CPU-seconds%s\n", C_GREEN, "CPU Usage", C_RESET, C_YELLOW, cpu_usage, C_RESET);
-    cmd_resp_printf(resp, "%s%-20s%s : %s%ld KB%s\n", C_GREEN, "Memory RSS", C_RESET, C_YELLOW, mem_rss_kb, C_RESET);
+    cmd_resp_printf(resp, "\n  %s%-20s%s : %s%d%s\n", C_GREEN, "PID", C_RESET, C_YELLOW, getpid(), C_RESET);
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%s%s\n", C_GREEN, "Uptime", C_RESET, C_YELLOW, uptime_str, C_RESET);
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%d%s\n", C_GREEN, "Threads", C_RESET, C_YELLOW, thread_count, C_RESET);
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%d%s\n", C_GREEN, "Open FDs", C_RESET, C_YELLOW, fd_count, C_RESET);
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%.2f CPU-seconds%s\n", C_GREEN, "CPU Usage", C_RESET, C_YELLOW, cpu_usage, C_RESET);
+    cmd_resp_printf(resp, "  %s%-20s%s : %s%ld KB%s\n", C_GREEN, "Memory RSS", C_RESET, C_YELLOW, mem_rss_kb, C_RESET);
 
     return 0;
 }
