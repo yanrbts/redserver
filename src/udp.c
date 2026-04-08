@@ -51,7 +51,6 @@ static inline uint32_t checksum_accumulate(const void *data, size_t len, uint32_
 
     /* Process 2 bytes at a time */
     while (len > 1) {
-        uint16_t word;
         /* Use memcpy to prevent unaligned access exceptions on ARM/MIPS */
         sum += ((uint32_t)ptr[0] << 8) | (uint32_t)ptr[1];
         ptr += 2;
