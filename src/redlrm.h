@@ -74,6 +74,7 @@ struct server {
     char *switch_ip;            /* IP switch server IP */
     int switch_port;            /* IP switch server port */
     int stch_hb_port;           /* Switch heartbeat port */
+    char *broadcast_ip;         /* Broadcast IP for GC discovery */
 
     nat_table_t *nat;           /* nat table */
     // gc_manager_t *gc_mgr;       /* 5GC manager */

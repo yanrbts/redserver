@@ -40,6 +40,7 @@
 #include "xdp_receiver.h"
 #include "pkteng.h"
 #include "af_unix.h"
+#include "gcprobe.h"
 #include "cmd.h"
 #include "cmdengine.h"
 
@@ -152,6 +153,7 @@ static void init_server_config(void) {
     redserver.switch_port = SWITCH_PORT_DEFAULT;
     redserver.core_hb_port = 0;
     redserver.stch_hb_port = 0;
+    redserver.broadcast_ip = zstrdup(GC_BROADCAST_IP);
 
     redserver.nat = NULL;
 
@@ -287,6 +289,9 @@ static void load_config_file(void) {
             if (redserver.s_hb_port < 0 || redserver.s_hb_port > 65535) {
                 err = "Invalid SWITCH heartbeat UDP port"; goto loaderr;
             }
+        } else if (!strcasecmp(first, "broadcastip")) {
+            free(redserver.broadcast_ip);
+            redserver.broadcast_ip = zstrdup(second);
         }
     }
     fclose(fp);
@@ -410,7 +415,7 @@ static void init_server(void) {
     // gc_mgr_set_new_target_cb(redserver.gc_mgr, on_new_target);
     // gc_mgr_set_child_state_cb(redserver.gc_mgr, on_child_state_change);
 
-    redserver.gc_probe = gc_probe_proc_create(ports_config, num_ports);
+    redserver.gc_probe = gc_probe_proc_create(ports_config, num_ports, redserver.broadcast_ip);
     redserver.smge = session_mgr_create(5000);
 
     xdp_receiver_config_t cfg = {
@@ -573,6 +578,7 @@ void server_cleanup() {
     free(redserver.auth_ip);
     free(redserver.core_ip);
     free(redserver.switch_ip);
+    free(redserver.broadcast_ip);
 
     xdp_receiver_stop(&redserver.handle);
     gc_probe_proc_destroy(redserver.gc_probe);

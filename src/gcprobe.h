@@ -18,7 +18,7 @@
 #define MAX_QUEUE_SIZE      128
 #define MAX_PAYLOAD_SIZE    2048
 #define GC_RETRY_THRESHOLD  3
-#define GC_BROADCAST_IP     "192.168.211.255"
+#define GC_BROADCAST_IP     "192.168.110.255"
 
 typedef enum gc_porttype {
     GC_MGR_BLACK = 0,
@@ -145,6 +145,7 @@ typedef struct gc_probe_processor {
 
     udp_conn_t *conn;
     void (*on_state_change)(uint32_t ip, int new_state);
+    const char *broadcast_ip;
 } gc_probe_processor_t;
 
 /**
@@ -155,7 +156,7 @@ typedef struct gc_probe_processor {
  * @param port_count Number of elements in the ports array.
  * @return gc_probe_processor_t* Pointer to the created processor, or NULL on failure.
  */
-gc_probe_processor_t* gc_probe_proc_create(const gc_probe_port_t *ports, size_t port_count);
+gc_probe_processor_t* gc_probe_proc_create(const gc_probe_port_t *ports, size_t port_count, const char *broadcast_ip);
 
 /**
  * @brief Enqueues a received packet for asynchronous processing.

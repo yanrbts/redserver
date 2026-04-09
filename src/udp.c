@@ -52,15 +52,20 @@ static inline uint32_t checksum_accumulate(const void *data, size_t len, uint32_
     /* Process 2 bytes at a time */
     while (len > 1) {
         /* Use memcpy to prevent unaligned access exceptions on ARM/MIPS */
-        sum += ((uint32_t)ptr[0] << 8) | (uint32_t)ptr[1];
+        uint16_t word;
+        memcpy(&word, ptr, 2);
+        sum += word;
+
         ptr += 2;
         len -= 2;
     }
 
     /* Handle remaining odd byte if present */
     if (len > 0) {
+        uint16_t last_word = 0;
         /* Per RFC 1071: Odd byte is treated as the MSB of a 16-bit word (padded with 0) */
-        sum += ((uint32_t)ptr[0] << 8);
+        memcpy(&last_word, ptr, 1);
+        sum += last_word;
     }
     return sum;
 }

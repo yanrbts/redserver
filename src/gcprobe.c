@@ -130,7 +130,7 @@ static void do_node_discovery(gc_probe_processor_t *proc, gc_node_context_t *nod
     req.port = node->port; 
     hdr_build((unsigned char*)&req.head.hdr, AUTH_DATA, sizeof(req), auth_get_static_value());
 
-    udp_send_raw(proc->conn, GC_BROADCAST_IP, node->port, &req, sizeof(req));
+    udp_send_raw(proc->conn, proc->broadcast_ip, node->port, &req, sizeof(req));
     node->last_send_ms = get_now_ms();
 
     log_debug("GC_PROBE: Discovery broadcast on port %u", node->port);
@@ -344,7 +344,7 @@ static void* probe_worker_thread(void *arg) {
     return NULL;
 }
 
-gc_probe_processor_t* gc_probe_proc_create(const gc_probe_port_t *ports, size_t port_count) {
+gc_probe_processor_t* gc_probe_proc_create(const gc_probe_port_t *ports, size_t port_count, const char *broadcast_ip) {
     if (!ports || port_count == 0) return NULL;
 
     gc_probe_processor_t *proc = calloc(1, sizeof(gc_probe_processor_t));
@@ -369,7 +369,8 @@ gc_probe_processor_t* gc_probe_proc_create(const gc_probe_port_t *ports, size_t 
         proc->nodes[i].last_send_ms = 0; 
     }
     proc->node_count = (int)port_count;
-
+    proc->on_state_change = NULL;
+    proc->broadcast_ip = broadcast_ip ? broadcast_ip : GC_BROADCAST_IP;
     proc->queue = malloc(sizeof(gc_probe_task_t) * MAX_QUEUE_SIZE);
     sem_init(&proc->sem, 0, 0);
     proc->running = true;
