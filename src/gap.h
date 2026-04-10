@@ -94,13 +94,23 @@
 #define GAP_INNER_PACKET_SIZE(json_len) \
     (offsetof(tunnel_inner_payload_t, data) + (json_len))
 
+// typedef struct {
+//     uint16_t dataLen;                   // Length of the following JSON data (network byte order)
+//     uint8_t  num;                       // Current fragment number (1-based)
+//     uint16_t total;                     // Total number of fragments (network byte order)
+//     uint8_t  rcpId;                     // Report ID
+//     uint8_t  method[GAP_METHOD_LEN];    // Method name (fixed 6 bytes, possibly padded with 0)
+//     uint8_t  url[GAP_URL_LEN];          // URL or path (fixed 128 bytes, padded with 0)
+//     uint8_t  data[];                    // JSON data length bytes
+// } __attribute__((packed)) tunnel_inner_payload_t;
+
 typedef struct {
-    uint16_t dataLen;                   // Length of the following JSON data (network byte order)
-    uint8_t  num;                       // Current fragment number (1-based)
-    uint16_t total;                     // Total number of fragments (network byte order)
-    uint8_t  rcpId;                     // Report ID
-    uint8_t  method[GAP_METHOD_LEN];    // Method name (fixed 6 bytes, possibly padded with 0)
     uint8_t  url[GAP_URL_LEN];          // URL or path (fixed 128 bytes, padded with 0)
+    uint8_t  method[GAP_METHOD_LEN];    // Method name (fixed 6 bytes, possibly padded with 0)
+    uint8_t  rcpId;                     // Report ID
+    uint16_t total;                     // Total number of fragments (network byte order)
+    uint8_t  num;                       // Current fragment number (1-based)
+    uint16_t dataLen;                   // Length of the following JSON data (network byte order)
     uint8_t  data[];                    // JSON data length bytes
 } __attribute__((packed)) tunnel_inner_payload_t;
 

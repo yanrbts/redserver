@@ -257,21 +257,49 @@ class BlackServerProtocol(asyncio.DatagramProtocol):
     def _handle_business(self, data: bytes, addr: Tuple[str, int]):
         """Process business logic packets (fastpath unpacking)."""
         try:
-            in_s = 54 # Data offset after Layer-2/3/4 headers
-            d_len, _, _, rcp = struct.unpack(">HBHB", data[in_s:in_s + 6])
+            # in_s = 54 # Data offset after Layer-2/3/4 headers
+            # d_len, _, _, rcp = struct.unpack(">HBHB", data[in_s:in_s + 6])
             
-            # Decode HTTP-like metadata
-            method = data[in_s + 6:in_s + 12].strip(b"\x00").decode("utf-8", "ignore")
-            url = data[in_s + 12:in_s + 140].strip(b"\x00").decode("utf-8", "ignore")
+            # # Decode HTTP-like metadata
+            # method = data[in_s + 6:in_s + 12].strip(b"\x00").decode("utf-8", "ignore")
+            # url = data[in_s + 12:in_s + 140].strip(b"\x00").decode("utf-8", "ignore")
             
-            json_start = in_s + 6 + 6 + 128
-            raw_json = data[json_start:json_start + d_len].decode("utf-8", "ignore")
+            # json_start = in_s + 6 + 6 + 128
+            # raw_json = data[json_start:json_start + d_len].decode("utf-8", "ignore")
+            # display_json = (raw_json[:64] + "...") if len(raw_json) > 64 else raw_json
+
+            # 基础偏移量（跳过之前的报文头层级）
+            in_s = 54 
+
+            # 1. 解析固定长度的字符串字段
+            # URL 在最前面，长度 128
+            url_raw = data[in_s : in_s + 128]
+            url = url_raw.strip(b"\x00").decode("utf-8", "ignore")
+            
+            # Method 紧随其后，长度 6
+            method_raw = data[in_s + 128 : in_s + 128 + 6]
+            method = method_raw.strip(b"\x00").decode("utf-8", "ignore")
+
+            # 2. 解析剩余的数值字段
+            # 偏移量 = in_s + 128 (url) + 6 (method) = in_s + 134
+            num_start = in_s + 134
+            
+            # 结构映射: 
+            # rcpId (B:1b), total (>H:2b), num (B:1b), dataLen (>H:2b)
+            # 格式字符串 ">BHBH" 刚好 6 个字节
+            rcp, total, num, d_len = struct.unpack(">BHBH", data[num_start : num_start + 6])
+
+            # 3. 解析 JSON 数据
+            # 数据起始位置 = 数值字段结束后的位置
+            json_start = num_start + 6
+            raw_json = data[json_start : json_start + d_len].decode("utf-8", "ignore")
+            
             display_json = (raw_json[:64] + "...") if len(raw_json) > 64 else raw_json
 
             self.state.log_biz(f"RCP:{rcp} | {method} {url} | DATA: {display_json} ({d_len}B)")
             
             if (self.isfragment):
-                large_json = self.generate_large_response(2)
+                large_json = self.generate_large_response(5)
                 self.send_back_to_red_fragmented(addr, data, large_json)
                 self.state.log_biz(f"SENT FRAG: {len(large_json)} bytes to {addr[0]}")
             else:
@@ -284,7 +312,14 @@ class BlackServerProtocol(asyncio.DatagramProtocol):
         """Build and transmit the back-channel response packet."""
         try:
             in_s = 54
-            _, _, _, orig_rcp = struct.unpack('>HBHB', original_data[in_s: in_s + 6])
+            # _, _, _, orig_rcp = struct.unpack('>HBHB', original_data[in_s: in_s + 6])
+
+            # 128 (url) + 6 (method) = 134
+            num_start = in_s + 134 
+            # 对应的 C 结构顺序是: rcpId(B), total(H), num(B), dataLen(H)
+            # 我们只需要 orig_rcp，它是第一个字段
+            rcp_id, total, num, data_len = struct.unpack('>BHBH', original_data[num_start : num_start + 6])
+            orig_rcp = rcp_id
             
             # Mock structured response
             mock_response = {
@@ -307,12 +342,24 @@ class BlackServerProtocol(asyncio.DatagramProtocol):
             new_ip_hdr = bytearray(orig_ip_hdr)
             new_ip_hdr[12:16], new_ip_hdr[16:20] = orig_d_ip, orig_s_ip
             
-            # Packet Assembly
-            inner_data_hdr = struct.pack('>HBHB', len(json_bytes), 1, 1, orig_rcp)
-            res_method = b"POST".ljust(6, b'\x00')
-            res_url = b"/api/v1/response".ljust(128, b'\x00')
-            full_inner_hdr = inner_data_hdr + res_method + res_url
-            
+            # # Packet Assembly
+            # inner_data_hdr = struct.pack('>HBHB', len(json_bytes), 1, 1, orig_rcp)
+            # res_method = b"POST".ljust(6, b'\x00')
+            # res_url = b"/api/v1/response".ljust(128, b'\x00')
+            # full_inner_hdr = inner_data_hdr + res_method + res_url
+
+            header_fmt = f">128s 6s B H B H" # 明确写出所有字段
+            # 组包
+            full_inner_hdr = struct.pack(
+                header_fmt,
+                b"/api/v1/response".ljust(128, b'\x00'), # url
+                b"POST".ljust(6, b'\x00'),               # method
+                int(orig_rcp),                           # rcpId (强制转int)
+                1,                                       # total
+                1,                                       # num
+                len(json_bytes)                          # dataLen
+            )
+
             new_udp_len = 8 + len(full_inner_hdr) + len(json_bytes)
             new_udp_hdr = struct.pack('>HHHH', orig_dp, orig_sp, new_udp_len, 0)
             
@@ -325,6 +372,7 @@ class BlackServerProtocol(asyncio.DatagramProtocol):
             
             resp_packet = struct.pack('>HHII', TYPE_DATA, full_len, auth_val, final_crc) + inner_content
             self.transport.sendto(resp_packet, (addr[0], self.state.port))
+            self.state.log_biz(f"SENT LENGTH: {len(resp_packet)} bytes to {addr[0]}")
         except Exception:
             pass
 
@@ -360,7 +408,13 @@ class BlackServerProtocol(asyncio.DatagramProtocol):
         try:
             # 1. 基础信息提取 (Mirroring)
             in_s = 54
-            _, _, _, orig_rcp = struct.unpack('>HBHB', original_data[in_s: in_s + 6])
+            # _, _, _, orig_rcp = struct.unpack('>HBHB', original_data[in_s: in_s + 6])
+
+            # 128 (url) + 6 (method) = 134
+            num_start = in_s + 134 
+            # 对应的 C 结构顺序是: rcpId(B), total(H), num(B), dataLen(H)
+            rcp_id, total, num, data_len = struct.unpack('>BHBH', original_data[num_start : num_start + 6])
+            orig_rcp = rcp_id
             
             # 镜像以太网/IP/UDP 元数据
             orig_eth = original_data[12:26]
@@ -398,11 +452,26 @@ class BlackServerProtocol(asyncio.DatagramProtocol):
                 # 构造内部数据头 (修改协议：第3个字节表示当前片，第4个字节表示总片数)
                 # 注意：这里需要根据你的协议规范微调字段含义
                 # H: chunk_len, B: current_frag, B: total_frags, H: rcp_id
-                inner_data_hdr = struct.pack('>HBHB', len(chunk), i + 1, total_frags, orig_rcp)
-                
-                res_method = b"POST".ljust(6, b'\x00')
-                res_url = b"/api/v1/response".ljust(128, b'\x00')
-                full_inner_hdr = inner_data_hdr + res_method + res_url
+
+                # inner_data_hdr = struct.pack('>HBHB', len(chunk), i + 1, total_frags, orig_rcp)
+                # res_method = b"POST".ljust(6, b'\x00')
+                # res_url = b"/api/v1/response".ljust(128, b'\x00')
+                # full_inner_hdr = inner_data_hdr + res_method + res_url
+
+
+
+                header_fmt = f">128s 6s B H B H" # 明确写出所有字段
+                # 组包
+                full_inner_hdr = struct.pack(
+                    header_fmt,
+                    b"/api/v1/response".ljust(128, b'\x00'), # url
+                    b"POST".ljust(6, b'\x00'),               # method
+                    int(orig_rcp),                           # rcpId (强制转int)
+                    total_frags,                             # total
+                    i + 1,                                   # num
+                    len(chunk)                               # dataLen
+                )
+
                 
                 # 重新计算 UDP 长度 (UDP Header + Inner Header + Chunk)
                 new_udp_len = 8 + len(full_inner_hdr) + len(chunk)

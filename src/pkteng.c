@@ -252,7 +252,8 @@ bool pkt_reverse_ope_to_red(const pkt_info_t *info) {
 
     if (unlikely(!session_mgr_lookup(smgr, &reverse_key, &orig))) {
         /* Frequent in edge cases, log at warn/debug level */
-        log_warn("Reverse lookup failed for %u:%hu", info->ip.src_ip, v_port);
+        log_warn("Reverse lookup failed for %u:%hu:%u %s:%s", 
+            info->ip.src_ip, v_port, reverse_key.rcp_id, assembled_inner->url, assembled_inner->method);
         gap_assemble_free_packet(complete_pkt_raw);
         return false;
     }
