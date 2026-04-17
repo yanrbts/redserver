@@ -19,6 +19,7 @@
 typedef struct {
     uint16_t version_major;
     uint16_t version_minor;
+    uint16_t version_patch;
     uint32_t mem_usage_kb;    // Memory footprint in KB
     uint16_t cpu_load;        // CPU load percentage (0-100)
     uint16_t custom_err;      // Specific internal error codes

@@ -66,8 +66,8 @@ GC_RESP = 0x02
 H_FMT = "!2sBBBBH"
 
 # Health Packet Format: 
-# Magic(I), Rack(B), Slot(B), Status(H), Uptime(I), V_Maj(H), V_Min(H), Mem(I), CPU(H), Err(H)
-HLTH_FMT = ">I BBH I HH I HH"
+# Magic(I), Rack(B), Slot(B), Status(H), Uptime(I), V_Maj(H), V_Min(H),V_Pat(H), Mem(I), CPU(H), Err(H)
+HLTH_FMT = ">I BBH I HHH I HH"
 HLTH_SIZE = struct.calcsize(HLTH_FMT)
 DEFAULT_PORT = 52719
 
@@ -533,12 +533,12 @@ def health_monitor_worker(state: GlobalState):
                     magic = struct.unpack(">I", payload[:4])[0]
                     if magic == 0x484C5448: # "HLTH" Magic
                         (magic, rack, slot, status, uptime, v_maj, 
-                         v_min, mem, cpu, err) = struct.unpack(HLTH_FMT, payload[:HLTH_SIZE])
+                         v_min, v_patch, mem, cpu, err) = struct.unpack(HLTH_FMT, payload[:HLTH_SIZE])
 
                         src_ip = socket.inet_ntoa(ip_data[12:16])
                         state.update_health((rack, slot), {
                             "addr": src_ip, "status": status, "uptime": uptime,
-                            "ver": f"v{v_maj}.{v_min}", "mem": mem / 1024,
+                            "ver": f"v{v_maj}.{v_min}.{v_patch}", "mem": mem / 1024,
                             "cpu": cpu, "err": err,
                         })
         except Exception:

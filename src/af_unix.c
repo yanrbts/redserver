@@ -24,6 +24,7 @@
 
 #define RED_LRM_VERSION_MAJOR    1
 #define RED_LRM_VERSION_MINOR    2
+#define RED_LRM_VERSION_PATCH    3
 #define LRM_RED_UNIX_PATH       "/tmp/redlrm_internal.sock"
 #define MAX_UNIX_CLIENTS         10
 
@@ -137,6 +138,7 @@ static void lrm_unix_internal_collect_with_ctx(lrm_collect_ctx_t *ctx, lrm_inter
 
     report->version_major = RED_LRM_VERSION_MAJOR; 
     report->version_minor = RED_LRM_VERSION_MINOR;
+    report->version_patch = RED_LRM_VERSION_PATCH;
     report->cpu_load = lrm_utils_get_cpu_load_internal(ctx);
 
     if (ctx->proc_status_fd >= 0) {

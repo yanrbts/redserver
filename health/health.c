@@ -232,6 +232,7 @@ static void lrm_health_pack_icmp(lrm_health_server_t *server,
         payload->detail.mem_usage_kb = htonl(internal_report.mem_usage_kb);
         payload->detail.version_major = htons(internal_report.version_major);
         payload->detail.version_minor = htons(internal_report.version_minor);
+        payload->detail.version_patch = htons(internal_report.version_patch);
         payload->detail.cpu_load = htons(internal_report.cpu_load);
         // Note: cpu_load is uint8/uint16, usually no conversion needed for single byte
     } else if (fetch_rc == -2) {
