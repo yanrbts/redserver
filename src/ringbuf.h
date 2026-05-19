@@ -1,93 +1,86 @@
 /*
- * Copyright (c) 2025-2025, yanruibinghxu@gmail.com All rights reserved.
+ * Copyright (c) 2025-2026, yanruibinghxu@gmail.com All rights reserved.
  * Copyright (c) lxc Ltd. All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Optimized for High-Throughput Stream Overwrite Mode.
  */
+
 #ifndef __RINGBUF_H__
 #define __RINGBUF_H__
 
-#include <inttypes.h>
+#include <stdint.h>
 #include <stdbool.h>
-#include <stdio.h>
+#include <stddef.h>
 #include <sys/mman.h>
 
 /**
- * ringbuf - Implements a simple and efficient memory mapped ringbuffer.
- * - The "addr" field of struct lxc_ringbuf is considered immutable. Instead the
- *   read and write offsets r_off and w_off are used to calculate the current
- *   read and write addresses. There should never be a need to use any of those
- *   fields directly. Instead use the appropriate helpers below.
- * - Callers are expected to synchronize read and write accesses to the
- *   ringbuffer.
+ * @struct ringbuf_hdr_t
+ * @brief Self-contained transactional header embedded directly inside the memory stream.
  */
-struct ringbuf {
-	char *addr; /* start address of the ringbuffer */
-	uint64_t size; /* total size of the ringbuffer in bytes */
-	uint64_t r_off; /* read offset */
-	uint64_t w_off; /* write offset */
-};
+typedef struct {
+    uint32_t pkt_len;          /* Pure data payload length in bytes */
+    uint32_t version_seq;      /* Transaction snapshot tracking token (lower 32-bits of tail) */
+    uint8_t  payload[];        /* Flexible array member pointing to continuous serialized data */
+} __attribute__((packed)) ringbuf_hdr_t;
 
 /**
- * lxc_ringbuf_create - Initialize a new ringbuffer.
- *
- * @param[in] size	Size of the new ringbuffer as a power of 2.
+ * @struct ringbuf
+ * @brief Thread-safe Multi-Consumer Mirror Ring Buffer using virtual memory wrapping.
  */
-int ringbuf_create(struct ringbuf *buf, size_t size);
-void ringbuf_move_read_addr(struct ringbuf *buf, size_t len);
-int ringbuf_write(struct ringbuf *buf, const char *msg, size_t len);
-int ringbuf_read(struct ringbuf *buf, char *out, size_t *len);
+typedef struct ringbuf {
+    uint8_t *addr;            /* Base address of the double-mapped contiguous virtual memory space */
+    uint64_t size;            /* Physical size of a single buffer window (must be page-aligned) */
+    volatile uint64_t head;   /* Shared monotonic virtual read offset across multiple consumers */
+    volatile uint64_t tail;   /* Monotonic virtual write offset managed by a single producer */
+} ringbuf_t;
 
-static inline void ringbuf_release(struct ringbuf *buf) {
-    if (buf->size)
-        munmap(buf->addr, buf->size * 2);
-}
+/**
+ * @brief Allocates and initializes the virtual mirror mapping ring buffer architecture.
+ * @param buf Pointer to the ring buffer structural tracking backbone.
+ * @param size Physical allocation size (bytes). Must be an exact multiple of the system page size.
+ * @return 0 on success, or a negative standard error code (e.g., -EINVAL, -ENOMEM).
+ */
+int ringbuf_create(ringbuf_t *buf, size_t size);
 
-static inline void ringbuf_clear(struct ringbuf *buf) {
-    buf->r_off = 0;
-    buf->w_off = 0;
-}
+/**
+ * @brief Safe teardown and dissociation of the underlying virtual memory segments.
+ * @param buf Pointer to the active ring buffer context.
+ */
+void ringbuf_release(ringbuf_t *buf);
 
-static inline uint64_t ringbuf_used(struct ringbuf *buf) {
-    return buf->w_off - buf->r_off;
-}
+/**
+ * @brief Unconditional mandatory overwrite streaming injection (Single-Producer safe).
+ * 
+ * Never blocks or rejects inputs. Automatically purges stale frames by pushing the 
+ * global head forward if the incoming ingestion payload risks a window overflow.
+ * 
+ * @param buf Pointer to the active ring buffer context.
+ * @param raw_hdr Optional peripheral metadata header (e.g., struct pcap_pkthdr). Pass NULL if unused.
+ * @param raw_hdr_len Length of the optional metadata header segment. Pass 0 if unused.
+ * @param data Core raw buffer network packet frames / payload segment.
+ * @param data_len Length of the core raw payload segment.
+ * @return 0 on successful commitment, negative error code on structural parameters constraint violation.
+ */
+int ringbuf_write(ringbuf_t *buf, 
+                  const void *raw_hdr, size_t raw_hdr_len,
+                  const void *data, size_t data_len);
 
-static inline uint64_t ringbuf_free(struct ringbuf *buf) {
-	return buf->size - ringbuf_used(buf);
-}
+/**
+ * @brief Concurrent thread-safe data frame extraction (Multi-Consumer safe).
+ * 
+ * Leverages Compare-And-Swap (CAS) optimistic locking to arbitrate zero-copy index indices.
+ * Executes dual-stage transactional validation to intercept and drop frames torn by write overruns.
+ * 
+ * @param buf Pointer to the active ring buffer context.
+ * @param out_hdr_buf Target memory segment to hold the retrieved metadata header (Optional, can be NULL).
+ * @param hdr_len Expected allocation constraint size of the targeted metadata header.
+ * @param out_data_buf Target user-space destination buffer where payload will be deep-copied.
+ * @param max_data_len Maximum allocation ceiling boundary size of out_data_buf container.
+ * @param out_actual_data_len Output variable returning the exact volume of extracted payload bytes.
+ * @return 0 on success, -1 if queue starved (empty), -2 on concurrency collision / transaction tearing (retry).
+ */
+int ringbuf_read(ringbuf_t *buf,
+                 void *out_hdr_buf, size_t hdr_len,
+                 void *out_data_buf, size_t max_data_len,
+                 uint32_t *out_actual_data_len);
 
-static inline char *ringbuf_get_read_addr(struct ringbuf *buf) {
-	return buf->addr + buf->r_off;
-}
-
-static inline char *ringbuf_get_write_addr(struct ringbuf *buf) {
-	return buf->addr + buf->w_off;
-}
-
-static inline void ringbuf_move_write_addr(struct ringbuf *buf, size_t len) {
-	buf->w_off += len;
-}
-
-#endif
+#endif /* __RINGBUF_H__ */

@@ -33,13 +33,33 @@ struct lrm_health_server {
     int interval;
 };
 
-static uint16_t calculate_checksum(void *b, int len) {
-    uint16_t *buf = b;
-    unsigned int sum = 0;
-    for (sum = 0; len > 1; len -= 2) sum += *buf++;
-    if (len == 1) sum += *(unsigned char *)buf;
+// static uint16_t calculate_checksum(void *b, int len) {
+//     uint16_t *buf = b;
+//     unsigned int sum = 0;
+//     for (sum = 0; len > 1; len -= 2) sum += *buf++;
+//     if (len == 1) sum += *(unsigned char *)buf;
+//     sum = (sum >> 16) + (sum & 0xFFFF);
+//     sum += (sum >> 16);
+//     return (uint16_t)(~sum);
+// }
+
+static uint16_t calculate_checksum(const void *data, int len) {
+    const uint8_t *buf = (const uint8_t *)data;
+    uint32_t sum = 0;
+
+    while (len > 1) {
+        sum += (buf[0] << 8) | buf[1];
+        buf += 2;
+        len -= 2;
+    }
+
+    if (len == 1) {
+        sum += buf[0] << 8;
+    }
+
     sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
+
     return (uint16_t)(~sum);
 }
 

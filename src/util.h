@@ -13,7 +13,6 @@
 #include <arpa/inet.h>
 #include <netdb.h>      /* Essential for getnameinfo and NI_MAXHOST */
 
-
 #ifndef likely
 #define likely(x)      __builtin_expect(!!(x), 1)
 #endif

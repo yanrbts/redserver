@@ -4,7 +4,7 @@ CFLAGS   := -ggdb -Wall -Wextra -O2 -DLOG_USE_COLOR -Iinclude -Isrc -Isrc/xdp
 BPF_CFLAGS := -O2 -g -target bpf -Iinclude -Isrc/xdp
 
 # 核心修改：将 XDP 库直接放入全局链接标志中，确保每个测试都能找到符号
-LDFLAGS  := -lpthread -lbpf -lelf -lz
+LDFLAGS  := -lpthread -lbpf -lelf -lz -lpcap
 
 HEALTH_DIR 	 := health
 SRC_DIR      := src

@@ -16,7 +16,8 @@
 /* Sub-command dictionaries for deeper completion */
 static const char *set_subs[] = {"interval", "logpkt", "debug", NULL};
 static const char *get_subs[] = {"config", "pktstats", NULL};
-static const char *help_subs[] = {"SET", "GET", NULL};
+static const char *pcap_subs[] = {"filter", "output", NULL};
+static const char *help_subs[] = {"SET", "GET", "PCAP", NULL};
 
 /* Professional UI Data Structure with Sub-command Support */
 static struct {
@@ -26,6 +27,7 @@ static struct {
 } cli_ui_data[] = {
     {"SET",    " <key> <value>", set_subs},
     {"GET",    " <key>",         get_subs},
+    {"PCAP",   " <key> <value>", pcap_subs},
     {"STATUS", " (Check server health)", NULL},
     {"HELP",   " [command]",      help_subs},
     {"EXIT",   " (Close console)", NULL},

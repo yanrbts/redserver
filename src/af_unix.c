@@ -19,12 +19,16 @@
 #include <sys/file.h>
 #include <signal.h>
 #include <fcntl.h>
+#include "util.h"
 #include "log.h"
 #include "af_unix.h"
 
-#define RED_LRM_VERSION_MAJOR    1
-#define RED_LRM_VERSION_MINOR    2
-#define RED_LRM_VERSION_PATCH    3
+#define RED_VERSION_NUMERIC     0x010020
+
+#define RED_LRM_VERSION_MAJOR 1 
+#define RED_LRM_VERSION_MINOR 2
+#define RED_LRM_VERSION_PATCH 3
+
 #define LRM_RED_UNIX_PATH       "/tmp/redlrm_internal.sock"
 #define MAX_UNIX_CLIENTS         10
 
@@ -129,6 +133,21 @@ static uint16_t lrm_utils_get_cpu_load_internal(lrm_collect_ctx_t *ctx) {
 // }
 
 /**
+ * @brief Populates the internal status structure with versioning information.
+ * * Version Format: 0xMMmmpp (Major.Minor.Patch)
+ * - Major: 0x01 (1)
+ * - Minor: 0x00 (0)
+ * - Patch: 0x02 (2)
+ */
+static inline void lrm_fill_version(lrm_internal_status_t *status, uint32_t raw_ver) {
+    if (unlikely(!status)) return;
+    
+    status->version_major = (uint16_t)((raw_ver >> 16) & 0xFF);
+    status->version_minor = (uint16_t)((raw_ver >> 8) & 0xFF);
+    status->version_patch = (uint16_t)(raw_ver & 0xFF);
+}
+
+/**
  * Internal Data Collection: Fetches deep telemetry data from the local process.
  * INDUSTRIAL GRADE: Uses robust /proc parsing, avoids buffer overflows, 
  * and handles potential file descriptor exhaustion.
@@ -136,9 +155,11 @@ static uint16_t lrm_utils_get_cpu_load_internal(lrm_collect_ctx_t *ctx) {
 static void lrm_unix_internal_collect_with_ctx(lrm_collect_ctx_t *ctx, lrm_internal_status_t *report) {
     if (!report) return;
 
-    report->version_major = RED_LRM_VERSION_MAJOR; 
-    report->version_minor = RED_LRM_VERSION_MINOR;
-    report->version_patch = RED_LRM_VERSION_PATCH;
+    // report->version_major = RED_LRM_VERSION_MAJOR; 
+    // report->version_minor = RED_LRM_VERSION_MINOR;
+    // report->version_patch = RED_LRM_VERSION_PATCH;
+    lrm_fill_version(report, RED_VERSION_NUMERIC);
+    
     report->cpu_load = lrm_utils_get_cpu_load_internal(ctx);
 
     if (ctx->proc_status_fd >= 0) {

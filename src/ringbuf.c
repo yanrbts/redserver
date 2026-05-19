@@ -1,217 +1,221 @@
-/*
- * Copyright (c) 2025-2025, yanruibinghxu@gmail.com All rights reserved.
- * Copyright (c) lxc Ltd. All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
- */
 #define _GNU_SOURCE
-#include <errno.h>
-#include <inttypes.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <fcntl.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <ringbuf.h>
+#include <errno.h>
+#include "util.h"
+#include "ringbuf.h"
 
-#define call_cleaner(cleaner) \
-	__attribute__((__cleanup__(cleaner##_function))) __attribute__((unused))
-
-#define close_prot_errno_disarm(fd) \
-	if (fd >= 0) {                  \
-		int _e_ = errno;            \
-		close(fd);                  \
-		errno = _e_;                \
-		fd = -EBADF;                \
-	}
-
-static inline void close_prot_errno_disarm_function(int *fd) {
-    close_prot_errno_disarm(*fd);
+/**
+ * @brief Safely determines system architecture memory page boundary requirements.
+ */
+static inline uint64_t _get_sys_pagesize(void) {
+    long pgsz = sysconf(_SC_PAGESIZE);
+    return (pgsz <= 0) ? 4096 : (uint64_t)pgsz;
 }
 
-#define __do_close call_cleaner(close_prot_errno_disarm)
-
-#define move_fd(fd)                         \
-	({                                  \
-		int __internal_fd__ = (fd); \
-		(fd) = -EBADF;              \
-		__internal_fd__;            \
-	})
-
-static inline uint64_t _getpagesize(void) {
-	int64_t pgsz;
-
-	pgsz = sysconf(_SC_PAGESIZE);
-	if (pgsz <= 0)
-		pgsz = 1 << 12;
-
-	return pgsz;
-}
-
-static inline int set_cloexec(int fd) {
-	return fcntl(fd, F_SETFD, FD_CLOEXEC);
-}
-
-static int make_tmpfile(char *template, bool rm) {
-    __do_close int fd = -EBADF;
-    int ret;
-    mode_t msk;
-
-    msk = umask(0022);
-    fd = mkstemp(template);
-    umask(msk);
-    if (fd < 0)
-        return -1;
-    
-    if (set_cloexec(fd))
-        return -1;
-    
-    if (!rm)
-        return move_fd(fd);
-    
-    ret = unlink(template);
-	if (ret < 0)
-		return -1;
-
-	return move_fd(fd);
-}
-
-int ringbuf_create(struct ringbuf *buf, size_t size) {
-    __do_close int memfd = -EBADF;
-    char *tmp;
-    int ret;
+int ringbuf_create(ringbuf_t *buf, size_t size) {
+    if (unlikely(!buf)) return -EINVAL;
 
     buf->size = size;
-    buf->w_off = 0;
-    buf->r_off = 0;
+    buf->head = 0;
+    buf->tail = 0;
 
-    /* verify that we are at least given the multiple of a page size */
-    if (buf->size % _getpagesize()){
-        fprintf(stderr, "ringbuf: size must be a multiple of the page size(%lu)\n", _getpagesize());
+    /* Verify strict page alignment configuration compliance */
+    if (unlikely(buf->size % _get_sys_pagesize())) {
+        fprintf(stderr, "ringbuf: size must be a multiple of the page size(%lu)\n", _get_sys_pagesize());
         return -EINVAL;
     }
-    
-    buf->addr = mmap(NULL, buf->size * 2, PROT_NONE,
-			MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (buf->addr == MAP_FAILED)
-		return -EINVAL;
-    
-    /* memfd_create()  creates an anonymous file and returns a file descriptor that refers to it.  
-     * The file behaves
-     * like a regular file, and so can be modified, truncated, memory-mapped, and so on.  
-     * However, unlike a regular file,  it  lives in RAM and has a volatile backing storage.  
-     * Once all references to the file are dropped, it is automatically released.  
-     * Anonymous memory is used for all backing pages of the  file.   Therefore,  files
-     * created  by memfd_create() have the same semantics as other anonymous memory 
-     * allocations such as those allocated using mmap(2) with the MAP_ANONYMOUS flag.*/
-    memfd = memfd_create(".ringbuf", MFD_CLOEXEC);
-    if (memfd < 0) {
-        char template[] = "/tmp/.ringbuf_XXXXXX";
 
-        if (errno != ENOSYS)
-            goto on_error;
-        
-        memfd = make_tmpfile(template, true);
+    /* Step 1: Reserve an unbacked contiguous virtual memory area twice the single size capacity */
+    buf->addr = (uint8_t *)mmap(NULL, buf->size * 2, PROT_NONE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (unlikely(buf->addr == MAP_FAILED)) {
+        return -ENOMEM;
     }
 
-    if (memfd < 0)
-        goto on_error;
-    
-    ret = ftruncate(memfd, buf->size);
-    if (ret < 0)
-        goto on_error;
-    
-    tmp = mmap(buf->addr, buf->size, PROT_READ | PROT_WRITE,
-		   MAP_FIXED | MAP_SHARED, memfd, 0);
-	if (tmp == MAP_FAILED || tmp != buf->addr)
-		goto on_error;
+    /* Step 2: Provision highly-optimized anonymous volatile backplane RAM storage */
+    int memfd = memfd_create(".ringbuf_shm", MFD_CLOEXEC);
+    if (unlikely(memfd < 0)) {
+        /* Fallback mechanism: Degrade to a hidden unlinked standard temporary disk asset if memfd_create is missing */
+        char template[] = "/tmp/.ringbuf_XXXXXX";
+        mode_t msk = umask(0022);
+        memfd = mkstemp(template);
+        umask(msk);
+        if (likely(memfd >= 0)) {
+            fcntl(memfd, F_SETFD, FD_CLOEXEC);
+            unlink(template); /* Unlink immediately for auto-cleanup closure guarantees on teardown */
+        }
+    }
 
-	tmp = mmap(buf->addr + buf->size, buf->size, PROT_READ | PROT_WRITE,
-		   MAP_FIXED | MAP_SHARED, memfd, 0);
-	if (tmp == MAP_FAILED || tmp != (buf->addr + buf->size))
-		goto on_error;
+    if (unlikely(memfd < 0)) {
+        munmap(buf->addr, buf->size * 2);
+        return -EIO;
+    }
 
-	return 0;
+    if (unlikely(ftruncate(memfd, buf->size) < 0)) {
+        close(memfd);
+        munmap(buf->addr, buf->size * 2);
+        return -EIO;
+    }
 
-on_error:
-	ringbuf_release(buf);
-	return -1;
-}
+    /* Step 3: Core Mirror Mechanism - Double map the same physical file into adjacent memory bounds */
+    /* Map the first half segment: [0 to size-1] */
+    uint8_t *tmp1 = (uint8_t *)mmap(buf->addr, buf->size, PROT_READ | PROT_WRITE, 
+                                    MAP_FIXED | MAP_SHARED, memfd, 0);
+    /* Map the mirror second half segment: [size to 2*size-1] mirroring offset 0 of the exact same descriptor */
+    uint8_t *tmp2 = (uint8_t *)mmap(buf->addr + buf->size, buf->size, PROT_READ | PROT_WRITE, 
+                                    MAP_FIXED | MAP_SHARED, memfd, 0);
 
-void ringbuf_move_read_addr(struct ringbuf *buf, size_t len) {
-    buf->r_off += len;
+    /* Reference count is now held directly by active virtual memory mappings; descriptor can be safely closed */
+    close(memfd); 
 
-    if (buf->r_off < buf->size)
-        return;
-    
-    /* wrap around */
-	buf->r_off -= buf->size;
-	buf->w_off -= buf->size;
-}
-
-int ringbuf_write(struct ringbuf *buf, const char *msg, size_t len) {
-    char *w_addr;
-    uint64_t free;
-
-    /* consistency check: a write should never exceed the ringbuffer's total size */
-	if (len > buf->size)
-		return -EFBIG;
-    
-    free = ringbuf_free(buf);
-
-    /* not enough space left so advance read address */
-	if (len > free)
-        ringbuf_move_read_addr(buf, len);
-    
-    w_addr = ringbuf_get_write_addr(buf);
-    memcpy(w_addr, msg, len);
-
-    ringbuf_move_write_addr(buf, len);
+    if (unlikely(tmp1 == MAP_FAILED || tmp2 == MAP_FAILED || tmp1 != buf->addr || tmp2 != (buf->addr + buf->size))) {
+        munmap(buf->addr, buf->size * 2);
+        return -EFAULT;
+    }
 
     return 0;
 }
 
-int ringbuf_read(struct ringbuf *buf, char *out, size_t *len) {
-    uint64_t used;
+void ringbuf_release(ringbuf_t *buf) {
+    if (likely(buf && buf->size)) {
+        munmap(buf->addr, buf->size * 2);
+        buf->addr = NULL;
+        buf->size = 0;
+    }
+}
 
-	/* there's nothing to read */
-	if (buf->r_off == buf->w_off)
-		return -ENODATA;
+int ringbuf_write(ringbuf_t *buf, 
+                  const void *raw_hdr, size_t raw_hdr_len,
+                  const void *data, size_t data_len) {
+    if (unlikely(!buf || !buf->addr || !data || !data_len)) return -EINVAL;
 
-	/* read maximum amount available */
-	used = ringbuf_used(buf);
-	if (used < *len)
-		*len = used;
+    size_t payload_total_len = raw_hdr_len + data_len;
+    size_t total_write_size = sizeof(ringbuf_hdr_t) + payload_total_len;
 
-	/* copy data to reader but don't advance addr */
-	memcpy(out, ringbuf_get_read_addr(buf), *len);
-	out[*len - 1] = '\0';
+    /* Structural Guard: A single transaction packet size must never scale beyond physical capacity limits */
+    if (unlikely(total_write_size > buf->size)) return -EFBIG;
 
-	return 0;
+    uint64_t current_tail = buf->tail;
+    uint64_t current_head = __atomic_load_n(&buf->head, __ATOMIC_ACQUIRE);
+
+    /* 
+     * Mandatory Overwrite Paradigm:
+     * If the incoming write block exceeds remaining free window volume, the single producer
+     * unconditionally shifts the global head pointer forward to purge the oldest unread frames.
+     */
+    while (unlikely((current_tail + total_write_size - current_head) > buf->size)) {
+        /* Advance head by optimized 64-byte chunks to instantly open sufficient write room */
+        if (__atomic_compare_exchange_n(&buf->head, &current_head, current_head + 64, 
+                                        true, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+            current_head += 64;
+        } else {
+            /* CAS fallback: Reload index since concurrent consumer operations advanced the head */
+            current_head = __atomic_load_n(&buf->head, __ATOMIC_ACQUIRE);
+        }
+    }
+
+    /* Translate the virtual global offset into raw physical target index via single modulus mapping */
+    uint8_t *w_ptr = buf->addr + (current_tail % buf->size);
+    ringbuf_hdr_t *hdr = (ringbuf_hdr_t *)w_ptr;
+
+    /* Transaction Phase 1: Invalidate version token to immediately block consumers from parsing garbage mid-write */
+    __atomic_store_n(&hdr->version_seq, (uint32_t)(current_tail + 1), __ATOMIC_RELEASE);
+
+    /* 
+     * Double-Mapping Advantage:
+     * Even if (w_ptr + total_write_size) overshoots the physical boundary, MMU page translation 
+     * automatically routes memory wraps to virtual address block 2. We can perform a continuous linear copy.
+     */
+    hdr->pkt_len = (uint32_t)payload_total_len;
+    
+    if (raw_hdr && raw_hdr_len > 0) {
+        memcpy(hdr->payload, raw_hdr, raw_hdr_len);
+    }
+    memcpy(hdr->payload + raw_hdr_len, data, data_len);
+
+    /* Transaction Phase 2: Commit and publish valid immutable transaction generation identity token */
+    __atomic_store_n(&hdr->version_seq, (uint32_t)current_tail, __ATOMIC_RELEASE);
+
+    /* Increment and publish global monotonic virtual write offset tracker */
+    buf->tail = current_tail + total_write_size;
+
+    return 0;
+}
+
+int ringbuf_read(ringbuf_t *buf,
+                 void *out_hdr_buf, size_t hdr_len,
+                 void *out_data_buf, size_t max_data_len,
+                 uint32_t *out_actual_data_len) {
+    if (unlikely(!buf || !buf->addr || !out_data_buf || !out_actual_data_len)) return -EINVAL;
+
+    uint64_t current_head;
+
+    while (1) {
+        current_head = __atomic_load_n(&buf->head, __ATOMIC_ACQUIRE);
+        uint64_t current_tail = __atomic_load_n(&buf->tail, __ATOMIC_ACQUIRE);
+
+        /* Queue Status Assessment: Check if stream tracks are starved of unconsumed data frames */
+        if (current_head >= current_tail) {
+            return -1; 
+        }
+
+        /* Calculate direct continuous reference location omitting boundary wrapping logic */
+        uint8_t *r_ptr = buf->addr + (current_head % buf->size);
+        ringbuf_hdr_t *hdr = (ringbuf_hdr_t *)r_ptr;
+
+        /* 
+         * Transaction Validation Alpha:
+         * Verify token version snapshot integrity. If mismatch is detected, an aggressive high-throughput
+         * producer has already run over this position. Discard current state loop iteration.
+         */
+        if (__atomic_load_n(&hdr->version_seq, __ATOMIC_ACQUIRE) != (uint32_t)current_head) {
+            /* Help advance the fouled head to a safe offset alignment and skip cycle */
+            __atomic_compare_exchange_n(&buf->head, &current_head, current_head + 8, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+            return -2;
+        }
+
+        uint32_t total_payload_len = hdr->pkt_len;
+        size_t total_read_size = sizeof(ringbuf_hdr_t) + total_payload_len;
+
+        /* Enforce internal bounds checks to prevent downstream buffer memory clipping overruns */
+        size_t actual_pure_data_len = (total_payload_len > hdr_len) ? (total_payload_len - hdr_len) : 0;
+        if (unlikely(actual_pure_data_len > max_data_len)) {
+            actual_pure_data_len = max_data_len;
+        }
+
+        /* Execute deep copy isolation extraction into consumer private thread storage stack workspace */
+        if (out_hdr_buf && hdr_len > 0) {
+            memcpy(out_hdr_buf, hdr->payload, hdr_len);
+        }
+        memcpy(out_data_buf, hdr->payload + hdr_len, actual_pure_data_len);
+        *out_actual_data_len = (uint32_t)actual_pure_data_len;
+
+        /* 
+         * Transaction Validation Beta:
+         * Double-verify token states. Ensures the data plane payload was not overwritten or torn 
+         * by the producer during the execution of the deep copy memcpy operation.
+         */
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (unlikely(__atomic_load_n(&hdr->version_seq, __ATOMIC_ACQUIRE) != (uint32_t)current_head)) {
+            /* Memory tearing detected due to race condition overwrite. Abort current transaction frame. */
+            return -2;
+        }
+
+        /* 
+         * Optimistic Concurrency Race (CAS):
+         * Atomically attempt to claim ownership of this frame against all other concurrent consumer threads.
+         */
+        if (likely(__atomic_compare_exchange_n(&buf->head, &current_head, current_head + total_read_size, 
+                                               false, __ATOMIC_RELEASE, __ATOMIC_RELAXED))) {
+            /* CAS success: Node processing ownership validated, exit routing safely */
+            return 0;
+        }
+        
+        /* CAS failed: Another sibling thread snatched this packet first. Loop and parse next index. */
+    }
 }

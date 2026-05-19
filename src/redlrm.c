@@ -163,6 +163,7 @@ static void init_server_config(void) {
     redserver.udpconn = NULL;
     redserver.handle = NULL;
     redserver.tm = NULL;
+    redserver.pcap_ctx = NULL;
 }
 
 static void load_config_file(void) {
@@ -446,6 +447,8 @@ static void init_server(void) {
     tm_add(redserver.tm, 1000, 5000, gap_assemble_cleanup, NULL);
 
     redserver.cmd_tid = cmd_start_core();
+
+    redserver.pcap_ctx = pcap_engine_init("ens33", "udp port 52719", 1, PCAP_OUT_FILE, "./pcap_output.pcap");
 }
 
 static void version(void) {
@@ -591,6 +594,7 @@ void server_cleanup() {
     gap_assemble_destroy();
     xdp_reasm_show_stats();
     cmd_server_stop(&redserver.cmd_tid);
+    pcap_engine_destroy(redserver.pcap_ctx);
     
     log_info("Memory cleaned up successfully");
 }
@@ -652,20 +656,6 @@ int main(int argc, char *argv[]) {
 
     show_banner();
 
-    // struct proxyinfo a_arg = {
-    //     .host = redserver.mip, 
-    //     .port = redserver.sport, 
-    //     .auth_host = redserver.auth_ip, 
-    //     .auth_port = redserver.auth_port, 
-    //     .dstport = redserver.core_port, 
-    //     .dstip = redserver.core_ip
-    // };
-
-    // if (pthread_create(&redserver.thrudpserver, NULL, proxy_listen_core, &a_arg) != 0) {
-    //     log_error("Failed to create C side thread");
-    //     return 1;
-    // }
-
     start_auth_refresh_service();
 
     start_auth_hearbeat_service();
@@ -677,12 +667,12 @@ int main(int argc, char *argv[]) {
 
     tm_run(redserver.tm, 100);
 
+    pcap_engine_start(redserver.pcap_ctx, NULL, NULL);
+
     int ret = xdp_receiver_start(redserver.handle);
     if (ret < 0) {
         log_error("Receiver loop exited with error: %d\n", ret);
     }
-
-    // pthread_join(redserver.thrudpserver, NULL);
 
     server_cleanup();
 
