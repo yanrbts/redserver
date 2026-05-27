@@ -20,6 +20,7 @@
 #include "gcprobe.h"
 #include "pkteng.h"
 #include "cmdengine.h"
+#include "pktpcap.h"
 
 /* Standard IPv4 Fragmentation Masks (RFC 791) */
 #define IP_MF_FLAG              0x2000                              /* More Fragments flag */
@@ -470,6 +471,10 @@ static inline uint16_t xdp_get_inner_dport(const uint8_t *payload, size_t payloa
 int xdp_handle_ringbuf(void *ctx, const uint8_t *data, size_t data_sz) {
     if (unlikely(!data || data_sz == 0)) return 0;
 
+    if (cmd_ispcap_enabled()) {
+        pcap_mod_inject(data, data_sz);
+    }
+    
     pkt_info_t info = {0};
     int ret;
     /* 1. Basic parsing of the outer L2/L3/L4 headers */

@@ -6,111 +6,57 @@
 #ifndef __PKTPCAP_H__
 #define __PKTPCAP_H__
 
-#include <pcap.h>
 #include <stdint.h>
-#include <errno.h>
-
-#define PCAP_OUT_NONE           ((uint8_t)0x00)
-#define PCAP_OUT_CONSOLE        ((uint8_t)0x01)
-#define PCAP_OUT_FILE           ((uint8_t)0x02)
-#define PCAP_OUT_VALID_MASK     (PCAP_OUT_CONSOLE | PCAP_OUT_FILE) /**< Valid output mode bitmask for sanity checks */
-
-#define PCAP_MAX_PACKET_SIZE    1600  /**< adapt to standard MTU + Ethernet header boundaries */
-typedef struct {
-    struct pcap_pkthdr header;
-    uint32_t len;
-    uint8_t data[PCAP_MAX_PACKET_SIZE];
-} pcap_packet_node_t;
-
-typedef struct pcap_backend_ctx pcap_backend_t;
+#include <stddef.h>
+/**
+ * @brief Initializes the unified hybrid pcap engine context.
+ * 
+ * Allocates descriptors, configures low-level ring buffers, and sets up
+ * the underlying live handler bound to the specified interface.
+ * 
+ * @param ifname Name of the physical network interface (e.g., "eth0").
+ * @param file   Destination storage path for the output .pcap file.
+ * @return int   0 on successful initialization; -1 on validation or activation failures.
+ */
+int pcap_mod_init(const char *ifname, const char *file);
 
 /**
- * @brief Initializes the high-performance packet capture engine.
+ * @brief Performs a root-safe, atomic dynamic BPF filter hot-swap.
  * 
- * @param ifname Name of the network interface (e.g., "eth0").
- * @param bpf_filter Berkeley Packet Filter (BPF) expression string. Pass NULL for no filtering.
- * @param promiscuous Set to 1 to enable promiscuous mode, 0 to disable.
- * @param output_mode Combined routing bitmasks (PCAP_OUT_CONSOLE, PCAP_OUT_FILE, or both).
- * @param save_path Absolute or relative file path for the output .pcap file (Ignored if PCAP_OUT_FILE is unset).
- * @return pcap_backend_t* Pointer to the initialized engine instance, or NULL on failure.
+ * Compiles the new expression out-of-band and executes an atomic pointer exchange.
+ * The life cycle of the replaced filter is safely tracked internally via atomic 
+ * reference counting, preventing dangling pointer references in concurrent data paths.
+ * 
+ * @param expr Standard tcpdump/pcap style string filter expression (e.g., "tcp port 443").
+ *             Passing NULL, an empty string, or "clear" safely disables filtering.
+ * @return int 0 on a successful hot-swap; -1 if compilation or memory allocation fails.
  */
-pcap_backend_t* pcap_engine_init(const char *ifname, 
-                                 const char *bpf_filter,
-                                 int promiscuous, 
-                                 uint8_t output_mode,
-                                 const char *save_path);
+int pcap_mod_set(const char *expr);
 
 /**
- * @brief Spawns an internal asynchronous worker thread and starts the packet capture pipeline.
- * @details This function is completely non-blocking. It delegates the heavy blocking loop to a dedicated,
- *          internally managed POSIX thread, fully isolating the data plane from the calling thread.
+ * @brief Data-Plane Ingestion Interface for Ingress Frames (Lock-Free & Thread-Safe).
  * 
- * @param ctx Pointer to the engine instance handle.
- * @param callback Custom user processing callback. Pass NULL to deploy the engine's built-in managed handler.
- * @param user_data Custom user pointer context passed directly into the custom callback.
- * @return int Returns 0 on successful thread spawning, or a negative value on failure.
+ * Tailored to ingest raw frames forwarded out of kernel space via eBPF/XDP 
+ * Ring Buffers. Applies user-space dynamic BPF rules before committing matching frames to disk.
  * 
- * @retval  0 Success: Worker thread spawned and running successfully.
- * @retval -1 Invalid Argument: The provided \p ctx is NULL.
- * @retval -2 Thread Creation Failed: Operating system resource exhaustion (pthread_create failed).
+ * @param data Pointer to the start of the raw Ethernet packet bytes.
+ * @param size Total byte length of the received frame payload.
  */
-int pcap_engine_start(pcap_backend_t *ctx, pcap_handler callback, u_char *user_data);
+void pcap_mod_inject(const uint8_t *data, size_t size);
 
 /**
- * @brief Asynchronously signals and synchronously joins the active worker thread to stop capture.
- * @details This function breaks the internal loop, waits for the worker thread to exit safely 
- *          (guaranteeing file descriptor flush), and resets internal active flags.
+ * @brief Data-Plane Ingestion Interface for Egress Frames (Thread-Safe).
  * 
- * @param ctx Pointer to the engine instance handle.
- * @return int Returns 0 on successful graceful shutdown, or a negative value if the engine was not running.
+ * Non-blocking loop iteration that drives the libpcap ring buffer to flush 
+ * and capture host-generated outbound packets directly from the kernel descriptor.
+ * 
+ * @return int Number of processed and dumped packets on success; -1 on internal engine errors.
  */
-int pcap_engine_stop(pcap_backend_t *ctx);
+int pcap_mod_poll(void);
 
 /**
- * @brief Dynamically updates or injects a new BPF filter at runtime during active capture.
- * @note This function is fully thread-safe and can be safely invoked while the background thread is running.
- * 
- * @param ctx Pointer to the engine instance handle.
- * @param new_bpf_filter New Berkeley Packet Filter expression string. Pass NULL or "" to clear all filters.
- * @return int Returns 0 on successful hot-swapping, or a negative value on compilation/injection failure.
+ * @brief Safely tears down the capture engine, unbinds structures, and flushes IO streams.
  */
-int pcap_engine_update_filter(pcap_backend_t *ctx, const char *new_bpf_filter);
-int pcap_engine_set_filter(const char *new_bpf_filter);
+void pcap_mod_free(void);
 
-/**
- * @brief Destroys the engine instance, safely stopping active threads, flushing buffers, and reclaiming system resources.
- * @note If the internal thread is still actively capturing, this will implicitly call pcap_engine_stop() first.
- * 
- * @param ctx Pointer to the engine instance handle.
- */
-void pcap_engine_destroy(pcap_backend_t *ctx);
-
-/**
- * @brief Dynamically hot-swaps the packet distribution target bitmask in a lock-free, thread-safe manner.
- * 
- * This method directly updates the active output routing state using atomic stores, bypassing
- * the heavy structural filter_mutex to prevent critical-path data plane stalls.
- * 
- * @param mode  New bitmask combination topology (e.g., PCAP_OUT_FILE | PCAP_OUT_MEMORY).
- * @return int  0 upon successful injection, or -1 if the backend context is invalid.
- */
-int pcap_engine_set_output_mode(uint8_t mode);
-
-
-// /**
-//  * @brief Serializes and submits a structural packet node object into the generic ring buffer.
-//  * @param ctx Pointer to the engine instance handle.
-//  * @param node Pointer to the self-contained source structure block.
-//  * @return 0 on success, negative code on constraint error.
-//  */
-// int pcap_write_node(pcap_backend_t *ctx, const pcap_packet_node_t *node);
-
-// /**
-//  * @brief Reconstructs and fills a structural packet node object out of the generic ring buffer.
-//  * @param ctx Pointer to the engine instance handle.
-//  * @param out_node Target memory structure block to receive the unmarshalled packet.
-//  * @return 0 on success, -1 on empty buffer, -2 on concurrency collision or tearing.
-//  */
-// int pcap_read_node(pcap_backend_t *ctx, pcap_packet_node_t *out_node);
-
-#endif /* __PKTPCAP_H__ */
+#endif /* PKTPCAP_H */

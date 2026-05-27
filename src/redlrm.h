@@ -88,7 +88,6 @@ struct server {
 
     timer_manager_t *tm;        /* time manager object */
     pthread_t cmd_tid;          /* cmd server thread id */
-    pcap_backend_t *pcap_ctx;     /* Packet capture engine context */
 };
 
 extern struct server redserver;

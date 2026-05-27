@@ -13,14 +13,14 @@
 #include "cmd.h"
 #include "cmdengine.h"
 #include "pktpcap.h"
-#include "redlrm.h"
+// #include "redlrm.h"
 
 typedef struct cmd_engine_s {
     atomic_int interval;       /* Atomic integer for scan interval */
     atomic_bool islogptk;      /* Atomic boolean for packet logging */
     atomic_bool isdebug;       /* Atomic boolean for debug mode */
+    atomic_bool ispcap;        /* Atomic boolean for pcap start */
     char filter_expr[256];     /* Buffer for BPF filter expression */
-    atomic_uint_least8_t output_mode;          /* Bitmask snapshot defining frame distribution targets */
     struct {
         atomic_uint_least64_t completed; /* Successfully reassembled datagrams */
         atomic_uint_least64_t timeout;   /* Reassembly attempts that timed out */
@@ -32,9 +32,9 @@ typedef struct cmd_engine_s {
 static cmd_engine_t cmdengine = {
     .interval = ATOMIC_VAR_INIT(1000),  /* Default 1000ms */
     .islogptk = ATOMIC_VAR_INIT(false), /* Default disabled */
-    .isdebug = ATOMIC_VAR_INIT(true),  /* Default enabled */
+    .isdebug = ATOMIC_VAR_INIT(true),   /* Default enabled */
+    .ispcap = ATOMIC_VAR_INIT(false),   /* Default disabled */
     .filter_expr = {0}, /* Empty filter by default */
-    .output_mode = ATOMIC_VAR_INIT(PCAP_OUT_NONE), /* Default no output */
     .reass_stats = {
         .completed = ATOMIC_VAR_INIT(0),
         .timeout = ATOMIC_VAR_INIT(0),
@@ -50,7 +50,7 @@ static int cmd_set_isdebug(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_get_reass_stats(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_get_config(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_pcap_filter(void *ctx, int argc, char **argv, cmd_resp_t *resp);
-static int cmd_pcap_output(void *ctx, int argc, char **argv, cmd_resp_t *resp);
+static int cmd_pcap_capture(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_handle_set(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_handle_get(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_handle_pcap(void *ctx, int argc, char **argv, cmd_resp_t *resp);
@@ -73,7 +73,7 @@ static const cmd_entry_t cmd_table[] = {
     {"GET", "config",   "get configuration",               "",           2, cmd_get_config},
     /* --- PCAP Group Sub-commands --- */
     {"PCAP", "filter",  "set BPF filter of packet",        "<expr>",     3, cmd_pcap_filter},
-    {"PCAP", "output",  "set PCAP output mode",            "<none|console|file|both>",     3, cmd_pcap_output},
+    {"PCAP", "capture", "set packet capture",              "<on/1|off/0>",   3, cmd_pcap_capture},
 
     {NULL, NULL, NULL, NULL, 0, NULL}
 };
@@ -370,8 +370,7 @@ static int cmd_pcap_filter(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
     strncpy(engine->filter_expr, filter_expr, sizeof(engine->filter_expr) - 1);
     engine->filter_expr[sizeof(engine->filter_expr) - 1] = '\0';
 
-
-    if (pcap_engine_set_filter(engine->filter_expr) < 0) {
+    if (pcap_mod_set(engine->filter_expr) < 0) {
         cmd_resp_red(resp, 
                     "ERR: Failed to update PCAP filter. Please check the filter syntax.\n\n"
                     "Supported common filters:\n"
@@ -379,6 +378,7 @@ static int cmd_pcap_filter(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
                     "• Specific IP: host 192.168.1.100\n"
                     "• Specific Port: tcp port 8080\n"
                     "• DNS         : udp port 53\n"
+                    "• Exclude filter: dst host 192.168.211.130 and tcp port 80\n"
                     "• Exclude loopback: not host 127.0.0.1\n\n"
                     "You can combine with 'and/or/not' and use parentheses.\n"
                     "Example: tcp and (port 80 or port 443) and host 10.0.0.1");
@@ -391,7 +391,7 @@ static int cmd_pcap_filter(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
     return 0;
 }
 
-static int cmd_pcap_output(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
+static int cmd_pcap_capture(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
     cmd_engine_t *engine = (cmd_engine_t *)ctx;
     if (!engine) {
         cmd_resp_red(resp, "ERR: System internal error: context is NULL.");
@@ -399,34 +399,29 @@ static int cmd_pcap_output(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
     }
 
     if (argc < 3 || argv[2] == NULL) {
-        cmd_resp_red(resp, "ERR: Missing parameter. Usage: PCAP output <none|console|file|both>");
+        cmd_resp_red(resp, "ERR: Missing parameter. Usage: PCAP start <on|off>");
         return -1;
     }
 
-    const char *mode_str = argv[2];
-    uint8_t new_mode = 0;
+    const char *val_str = argv[2];
+    bool enable;
 
-    if (strcasecmp(mode_str, "none") == 0) {
-        new_mode = PCAP_OUT_NONE;
-    } else if (strcasecmp(mode_str, "console") == 0) {
-        new_mode = PCAP_OUT_CONSOLE;
-    } else if (strcasecmp(mode_str, "file") == 0) {
-        new_mode = PCAP_OUT_FILE;
-    } else if (strcasecmp(mode_str, "both") == 0) {
-        new_mode = PCAP_OUT_CONSOLE | PCAP_OUT_FILE;
+    if (strcmp(val_str, "1") == 0 || 
+        strcasecmp(val_str, "on") == 0 || 
+        strcasecmp(val_str, "true") == 0) {
+        enable = true;
+    } else if (strcmp(val_str, "0") == 0 || 
+               strcasecmp(val_str, "off") == 0 || 
+               strcasecmp(val_str, "false") == 0) {
+        enable = false;
     } else {
-        cmd_resp_red(resp, "ERR: Invalid output mode '%s'. Expected: none, console, file, or both.", mode_str);
+        cmd_resp_red(resp, "ERR: Invalid value '%s'. Expected: on or off.", val_str);
         return -1;
     }
 
-    if (pcap_engine_set_output_mode(new_mode) < 0) {
-        cmd_resp_red(resp, "ERR: Failed to update PCAP output mode. Please try again.");
-        return -1;
-    }
-
-    atomic_store(&engine->output_mode, new_mode);
-    cmd_resp_green(resp, "OK: PCAP output mode set to '%s'.", mode_str);
-    log_info("[MGMT] Configuration updated: PCAP output mode set to '%s' by administrator.", mode_str);
+    atomic_store(&engine->ispcap, enable);
+    cmd_resp_green(resp, "OK: Packet capture %s.", enable ? "STARTED" : "STOPPED");
+    log_info("[MGMT] Configuration updated: Packet capture %s by administrator.", enable ? "STARTED" : "STOPPED");
 
     return 0;
 }
@@ -666,10 +661,8 @@ static int cmd_get_config(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
                     C_RESET);
     
     cmd_resp_printf(resp, "  %s%-20s%s : %s%s%s\n", 
-                    C_GREEN, "output", C_RESET, 
-                    C_YELLOW, atomic_load(&engine->output_mode) == PCAP_OUT_NONE ? "(none)" : 
-                             atomic_load(&engine->output_mode) == PCAP_OUT_CONSOLE ? "(console)" : 
-                             atomic_load(&engine->output_mode) == PCAP_OUT_FILE ? "(file)" : "(both)",
+                    C_GREEN, "capture", C_RESET, 
+                    C_YELLOW, cmd_ispcap_enabled() ? "on" : "off",
                     C_RESET);
 
     return 0;
@@ -721,7 +714,7 @@ pthread_t cmd_start_core(void) {
         return 0; 
     }
 
-    log_info("[CORE] Management plane initialized successfully. Thread ID: %lu\n", (unsigned long)tid);
+    log_info("[CORE] Management plane initialized successfully. Thread ID: %lu", (unsigned long)tid);
     
     return tid;
 }
@@ -732,6 +725,10 @@ bool cmd_islogpkt_enabled(void) {
 
 bool cmd_isdebug_enabled(void) {
     return atomic_load(&cmdengine.isdebug);
+}
+
+bool cmd_ispcap_enabled(void) {
+    return atomic_load(&cmdengine.ispcap);
 }
 
 /**

@@ -163,7 +163,6 @@ static void init_server_config(void) {
     redserver.udpconn = NULL;
     redserver.handle = NULL;
     redserver.tm = NULL;
-    redserver.pcap_ctx = NULL;
 }
 
 static void load_config_file(void) {
@@ -448,7 +447,7 @@ static void init_server(void) {
 
     redserver.cmd_tid = cmd_start_core();
 
-    redserver.pcap_ctx = pcap_engine_init("ens33", "udp port 52719", 1, PCAP_OUT_FILE, "./pcap_output.pcap");
+    pcap_mod_init("ens33", "./output.pcap");
 }
 
 static void version(void) {
@@ -594,7 +593,7 @@ void server_cleanup() {
     gap_assemble_destroy();
     xdp_reasm_show_stats();
     cmd_server_stop(&redserver.cmd_tid);
-    pcap_engine_destroy(redserver.pcap_ctx);
+    pcap_mod_free();
     
     log_info("Memory cleaned up successfully");
 }
@@ -666,8 +665,6 @@ int main(int argc, char *argv[]) {
     lrm_unix_server_start(200);
 
     tm_run(redserver.tm, 100);
-
-    pcap_engine_start(redserver.pcap_ctx, NULL, NULL);
 
     int ret = xdp_receiver_start(redserver.handle);
     if (ret < 0) {

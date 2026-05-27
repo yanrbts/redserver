@@ -18,6 +18,7 @@
 #include "xdp_pkt_parser.h"
 #include "gap.h"
 #include "log.h"
+#include "pktpcap.h"
 
 /**
  * @struct xdp_internal_ctx
@@ -123,6 +124,10 @@ int xdp_receiver_start(void *ctx) {
         if (ret < 0 && ret != -EINTR) {
             log_error("Ring buffer polling error: %d\n", ret);
             return ret;
+        }
+
+        if (cmd_ispcap_enabled()) {
+            pcap_mod_poll();
         }
     }
 

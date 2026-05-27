@@ -17,16 +17,25 @@
  * or 0 if the table registration or thread creation fails.
  */
 pthread_t cmd_start_core(void);
+
 /**
  * @brief Checks if xdp raw packet logging is currently enabled.
  * @return true if logging is enabled, false otherwise.
  */
 bool cmd_islogpkt_enabled(void);
+
 /**
  * @brief Checks if debug mode is currently enabled.
  * @return true if debug mode is enabled, false otherwise.
  */
 bool cmd_isdebug_enabled(void);
+
+/**
+ * @brief Checks if packet capture is currently enabled.
+ * @return true if packet capture is enabled, false otherwise.
+ */
+bool cmd_ispcap_enabled(void);
+
 /**
  * @brief Increments the reassembly statistics counters in a thread-safe manner.
  * This function can be called from the XDP packet parser to update the engine's

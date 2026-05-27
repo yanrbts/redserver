@@ -467,7 +467,7 @@ static void *cmd_server_worker(void *arg) {
         return NULL;
     }
 
-    log_info("[MGMT] Server thread started. Port: %s\n", SOCKET_PATH);
+    log_info("[MGMT] Server thread started. Port: %s", SOCKET_PATH);
 
     while (atomic_load(&g_server_running)) {
 

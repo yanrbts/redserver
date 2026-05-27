@@ -16,7 +16,7 @@
 /* Sub-command dictionaries for deeper completion */
 static const char *set_subs[] = {"interval", "logpkt", "debug", NULL};
 static const char *get_subs[] = {"config", "pktstats", NULL};
-static const char *pcap_subs[] = {"filter", "output", NULL};
+static const char *pcap_subs[] = {"filter", "capture", NULL};
 static const char *help_subs[] = {"SET", "GET", "PCAP", NULL};
 
 /* Professional UI Data Structure with Sub-command Support */
