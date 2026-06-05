@@ -6,6 +6,7 @@ import sys
 import time
 import re
 from datetime import datetime
+import struct
 
 # 引入 Rich 库相关组件，用于构建终端 UI
 from rich.align import Align
@@ -96,6 +97,88 @@ else:
             pass
         return None
 
+class TunnelPayloadParser:
+    """针对 C 结构体 hdr_t + tunnel_payload_t 的双层嵌套解析器（小端序版）"""
+    
+    HDR_SIZE = 12
+    TUNNEL_FIXED_SIZE = 12 + 14 + 20 + 8  # auth(12) + eth(14) + ip(20) + udp(8)
+
+    @classmethod
+    def parse_and_render(cls, raw_bytes: bytes, generate_hex_dump_func) -> Table | None:
+        """
+        解析双层 C 结构体，全部采用小端序(<)解析数值
+        """
+        if len(raw_bytes) < cls.HDR_SIZE + cls.TUNNEL_FIXED_SIZE:
+            return None
+
+        try:
+            # 1. 解析外层 hdr_t (使用 '<' 代表小端序)
+            # H=uint16_t, I=uint32_t
+            type_val, len_val, out_auth, out_crc = struct.unpack("<HHII", raw_bytes[:cls.HDR_SIZE])
+            
+            # 2. 提取内层 tunnel_payload_t 报头
+            tunnel_start = cls.HDR_SIZE
+            tunnel_fixed_bytes = raw_bytes[tunnel_start : tunnel_start + cls.TUNNEL_FIXED_SIZE]
+            
+            inner_auth = tunnel_fixed_bytes[0:12]
+            eth_header = tunnel_fixed_bytes[12:26]
+            ip_header  = tunnel_fixed_bytes[26:46]
+            udp_header = tunnel_fixed_bytes[46:54]
+
+            # 3. 提取隧道载荷 inner_data[]
+            inner_data_start = cls.HDR_SIZE + cls.TUNNEL_FIXED_SIZE
+            inner_data = raw_bytes[inner_data_start:]
+
+            # 4. 解析以太网头部 (小端序下 EtherType 需要倒过来解析)
+            dst_mac = ":".join(f"{b:02x}" for b in eth_header[0:6])
+            src_mac = ":".join(f"{b:02x}" for b in eth_header[6:12])
+            ether_type = struct.unpack("<H", eth_header[12:14])[0]
+            
+            # 5. 解析 IP 头部 (源IP和目的IP的4字节本身是流式的，但如果是通过小端整型强转过去的则需要注意)
+            # 这里先按照标准的字节流顺序读取，如果不对，可以尝试使用 struct.unpack("<I", ...) 再转换
+            src_ip = ".".join(str(b) for b in ip_header[12:16])
+            dst_ip = ".".join(str(b) for b in ip_header[16:20])
+            
+            # 6. 解析 UDP 头部 (使用 '<' 小端序解析端口和长度)
+            src_port, dst_port, udp_len = struct.unpack("<HHH", udp_header[0:6])
+
+            # 7. 构建 Rich UI 视图
+            grid = Table.grid(expand=True, padding=(0, 1))
+            grid.add_column("Key", style="bold magenta", width=18)
+            grid.add_column("Value", style="cyan")
+
+            # 展示外层
+            grid.add_row("[Outer] Type:", f"0x{type_val:04X} (LE)")
+            grid.add_row("[Outer] Length:", f"{len_val} Bytes")
+            grid.add_row("[Outer] Auth32:", f"0x{out_auth:08X}")
+            grid.add_row("[Outer] CRC32:", f"0x{out_crc:08X}")
+            
+            grid.add_row("-" * 20, "-" * 50)
+            
+            # 展示内层
+            grid.add_row("[Tunnel] Auth (12B):", f"[bold yellow]0x{inner_auth.hex().upper()}[/bold yellow]")
+            grid.add_row("[Tunnel] L2 Ether:", f"Src: {src_mac} -> Dst: {dst_mac} (Type: 0x{ether_type:04X})")
+            grid.add_row("[Tunnel] L3 IPv4:", f"{src_ip} -> {dst_ip}")
+            grid.add_row("[Tunnel] L4 UDP:", f"Port: {src_port} -> {dst_port} (Len: {udp_len}B)")
+            
+            grid.add_row("-" * 20, "-" * 50)
+            grid.add_row("[Inner Payload]:", f"Total [yellow]{len(inner_data)}[/yellow] Bytes")
+
+            # 渲染内层 payload 的 hex dump
+            if inner_data:
+                hex_view = generate_hex_dump_func(inner_data)
+            else:
+                hex_view = Text("    (No Inner Payload Data)", style="grey50")
+
+            wrapper = Table.grid(expand=True)
+            wrapper.add_row(grid)
+            wrapper.add_row(Panel(hex_view, border_style="grey37", title="inner_data Hex Dump"))
+
+            return wrapper
+
+        except Exception:
+            return None
+        
 
 class PcapAnalyzer:
     # 🎯 预设的命令补全词库，包含常用过滤关键字段与协议
@@ -550,10 +633,31 @@ class PcapAnalyzer:
             temp_layer = temp_layer.payload if hasattr(temp_layer, 'payload') and temp_layer.payload and temp_layer.payload.name != "NoPayload" else None
 
         raw_bytes = bytes(current_pkt)
+
+        # 3. 传入自适应类：解析双层 C 头，并将外部的 self.generate_hex_dump 函数引用传进去用来渲染载荷
+        tunnel_view = TunnelPayloadParser.parse_and_render(raw_bytes, self.generate_hex_dump)
+
+        detail_table = Table.grid(expand=True)
+        detail_table.add_row(root_tree)
+        
+        if tunnel_view is not None:
+            # 【分支一】成功匹配嵌套的 C 头结构体，只针对内层 payload 打印 Hex
+            detail_table.add_row(Rule("(C-Struct Tunnel Parsed)", style="bold yellow"))
+            detail_table.add_row(tunnel_view)
+        else:
+            # 【分支二】常规报文，对全包进行大 Hex Dump 兜底
+            hex_dump_text = self.generate_hex_dump(raw_bytes)
+            detail_table.add_row(Rule("(Full Packet Hex Dump)", style="grey50"))
+            detail_table.add_row(hex_dump_text)
+
+        pkt_id = self.filtered_packets[self.selected_idx]["id"]
+        return Panel(detail_table, title=f" 详细解析 - 编号 #{pkt_id} ", border_style="gold1", box=box.ROUNDED)
+
         hex_dump_text = self.generate_hex_dump(raw_bytes)
 
         detail_table = Table.grid(expand=True)
         detail_table.add_row(root_tree)
+
         detail_table.add_row(Rule("(Hex Dump)", style="grey50"))
         detail_table.add_row(hex_dump_text)
 

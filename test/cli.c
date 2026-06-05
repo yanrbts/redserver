@@ -14,8 +14,8 @@
 #define REFLEX_PROMPT   "reflex> " 
 
 /* Sub-command dictionaries for deeper completion */
-static const char *set_subs[] = {"interval", "logpkt", "debug", NULL};
-static const char *get_subs[] = {"config", "pktstats", NULL};
+static const char *set_subs[] = {"interval", "logpkt", "debug", "auth", NULL};
+static const char *get_subs[] = {"config", "pktstats", "heartbeat", NULL};
 static const char *pcap_subs[] = {"filter", "capture", NULL};
 static const char *help_subs[] = {"SET", "GET", "PCAP", NULL};
 
@@ -23,19 +23,20 @@ static const char *help_subs[] = {"SET", "GET", "PCAP", NULL};
 static struct {
     const char *name;
     const char *hint;
-    const char **subs; /* Pointer to sub-command array, NULL if none */
+    const char **subs;    /* Pointer to sub-command array, NULL if none */
+    const char *sub_hint;
 } cli_ui_data[] = {
-    {"SET",    " <key> <value>", set_subs},
-    {"GET",    " <key>",         get_subs},
-    {"PCAP",   " <key> <value>", pcap_subs},
-    {"STATUS", " (Check server health)", NULL},
-    {"HELP",   " [command]",      help_subs},
-    {"EXIT",   " (Close console)", NULL},
-    {NULL, NULL, NULL}
+    {"SET",    " <key> <value>", set_subs,   " <value>"},
+    {"GET",    " <key>",         get_subs,   NULL},       
+    {"PCAP",   " <key> <value>", pcap_subs,  " <value>"},
+    {"STATUS", " (Check server health)", NULL, NULL},
+    {"HELP",   " [command]",      help_subs,  NULL},
+    {"EXIT",   " (Close console)", NULL,     NULL},
+    {NULL, NULL, NULL, NULL}
 };
 
 static void reflex_show_banner(void) {
-    const char *VERSION = "1.0.1";
+    const char *VERSION = "1.0.2";
     const char *AUTHOR  = "yanrb";
     const char *PROJECT = "Reflex High-Performance Control System";
 
@@ -106,35 +107,90 @@ static void completion_callback(const char *buf, linenoiseCompletions *lc) {
 }
 
 /**
- * @brief Context-aware Hints: Shows parameter ghosts based on current level.
+ * @brief Context-aware Hints: Dynamically routes hints based on sub_hint properties.
  */
 static char *hints_callback(const char *buf, int *color, int *bold) {
-    *color = 90; // Dark Gray
+    *color = 90; /* Dark Gray ghost text color descriptor */
     *bold = 0;
     if (!buf || !*buf) return NULL;
 
-    /* Check if the user is typing a sub-command (has a space) */
-    const char *space_pos = strchr(buf, ' ');
+    /* 1. Tokenize input snapshot to evaluate architectural boundary constraints */
+    char *buf_copy = strdup(buf);
+    char *tokens[3] = {NULL, NULL, NULL};
+    int token_count = 0;
     
-    if (space_pos) {
-        /* User is at or past the first space */
-        size_t cmd_len = space_pos - buf;
-        for (int i = 0; cli_ui_data[i].name; i++) {
-            if (strncasecmp(buf, cli_ui_data[i].name, cmd_len) == 0 && 
-                strlen(cli_ui_data[i].name) == cmd_len) {
+    char *token = strtok(buf_copy, " ");
+    while (token && token_count < 3) {
+        tokens[token_count++] = token;
+        token = strtok(NULL, " ");
+    }
+    
+    size_t buf_len = strlen(buf);
+    int ends_with_space = (buf_len > 0 && buf[buf_len - 1] == ' ');
+    char *primary = tokens[0];
+
+    /* 2. Traverse data matrix to isolate top-tier node signatures */
+    for (int i = 0; cli_ui_data[i].name; i++) {
+        if (strcasecmp(primary, cli_ui_data[i].name) == 0) {
+            
+            /* Scenario A: User typed exactly the primary token (e.g., "SET" without space).
+             * Route default generic hint immediately.
+             */
+            if (token_count == 1 && !ends_with_space) {
+                free(buf_copy);
+                return (char *)cli_ui_data[i].hint;
+            }
+            
+            /* Scenario B: Active tracking during second-tier initialization or partial matching.
+             * (e.g., "SET " or "SET i", "GET con" where command is incomplete).
+             */
+            if ((token_count == 1 && ends_with_space) || 
+                (token_count == 2 && !ends_with_space)) {
                 
-                /* If they just typed "SET ", show the generic hint */
-                return (char *)cli_ui_data[i].hint;
+                const char *sub_part = (token_count == 2) ? tokens[1] : "";
+                size_t sub_len = strlen(sub_part);
+                
+                int is_partial_sub = 0;
+                if (cli_ui_data[i].subs && sub_len > 0) {
+                    for (int j = 0; cli_ui_data[i].subs[j]; j++) {
+                        /* Validate if token matches sub-command matrix slice as a prefix */
+                        if (strncasecmp(sub_part, cli_ui_data[i].subs[j], sub_len) == 0 &&
+                            strcasecmp(sub_part, cli_ui_data[i].subs[j]) != 0) {
+                            is_partial_sub = 1;
+                            break;
+                        }
+                    }
+                }
+
+                /* Keep emitting primary hint block if no sub-command has consolidated yet */
+                if (sub_len == 0 || is_partial_sub) {
+                    free(buf_copy);
+                    return (char *)cli_ui_data[i].hint;
+                }
             }
-        }
-    } else {
-        /* User is still typing the primary command */
-        for (int i = 0; cli_ui_data[i].name; i++) {
-            if (strcasecmp(buf, cli_ui_data[i].name) == 0) {
-                return (char *)cli_ui_data[i].hint;
+
+            /* Scenario C: Core Target Realignment.
+             * User has completely matched a valid sub-command descriptor (e.g., "GET config" or "SET interval").
+             */
+            if ((token_count == 2) || (token_count == 3 && !ends_with_space)) {
+                const char *exact_sub = tokens[1];
+                
+                if (cli_ui_data[i].subs) {
+                    for (int j = 0; cli_ui_data[i].subs[j]; j++) {
+                        /* Match verified. Delegate response to specific tail parameters configuration */
+                        if (strcasecmp(exact_sub, cli_ui_data[i].subs[j]) == 0) {
+                            free(buf_copy);
+                            /* Dynamically route tailored metadata string (e.g. " <value>" vs NULL) */
+                            return (char *)cli_ui_data[i].sub_hint;
+                        }
+                    }
+                }
             }
+            break;
         }
     }
+
+    free(buf_copy);
     return NULL;
 }
 
@@ -147,7 +203,6 @@ int main() {
     reflex_show_banner();
 
     while ((line = linenoise(REFLEX_PROMPT)) != NULL) {
-        /* Basic input validation */
         if (line[0] != '\0') {
             if (strcasecmp(line, "exit") == 0 || strcasecmp(line, "quit") == 0) {
                 free(line);
