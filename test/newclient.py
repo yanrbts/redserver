@@ -32,11 +32,13 @@ class GapFullClient:
     def _build_packet(self, data_size, rcp_id):
         """构造包含 Header 和 JSON 的完整二进制包"""
         # 生成 JSON 数据
+        usable_json_size = data_size - 140 
+        
         base_dict = {"rcpId": rcp_id, "msg": "hello", "padding": ""}
         current_json = json.dumps(base_dict).encode()
         
-        if data_size > len(current_json):
-            base_dict["padding"] = "x" * (data_size - len(current_json))
+        if usable_json_size > len(current_json):
+            base_dict["padding"] = "x" * (usable_json_size - len(current_json))
             json_bytes = json.dumps(base_dict).encode()
         else:
             json_bytes = current_json
@@ -75,71 +77,13 @@ class GapFullClient:
         )
         return header + json_bytes
 
-    # def _unpack_inner_response(self, data):
-    #     """
-    #     直接解析内部业务头 (Inner Header)
-    #     结构: dataLen(2) + num(1) + total(2) + rcpId(1) + Method(6) + URL(128) = 140字节
-    #     """
-    #     try:
-    #         # 1. 长度校验
-    #         if len(data) < 140:
-    #             return f"[!] 数据包太短，无法解析头 (实际长度: {len(data)})"
-
-    #         # # 2. 解析 140 字节的 Header
-    #         # # 使用 '!' 代表大端 (Network Byte Order)
-    #         # header_fmt = f"!H B H B {GAP_METHOD_LEN}s {GAP_URL_LEN}s"
-    #         # header_size = struct.calcsize(header_fmt)
-            
-    #         # header_data = data[:header_size]
-    #         # data_len, num, total, rcp_id, method, url = struct.unpack(header_fmt, header_data)
-
-    #         # 2. 解析 140 字节的 Header
-    #         # 修改后的顺序：url(128s), method(6s), rcpId(B), total(H), num(B), dataLen(H)
-    #         header_fmt = f"!{GAP_URL_LEN}s {GAP_METHOD_LEN}s B H B H"
-    #         header_size = struct.calcsize(header_fmt)
-
-    #         if len(data) < header_size:
-    #             return  # 基础长度检查
-
-    #         header_data = data[:header_size]
-
-    #         # 按照新的格式字符串解包
-    #         # 返回顺序对应：url, method, rcp_id, total, num, data_len
-    #         url_raw, method_raw, rcp_id, total, num, data_len = struct.unpack(header_fmt, header_data)
-
-    #         # 清理字符串末尾的空字节并解码
-    #         url = url_raw.strip(b"\x00").decode("utf-8", "ignore")
-    #         method = method_raw.strip(b"\x00").decode("utf-8", "ignore")
-
-    #         # 3. 提取 JSON Payload
-    #         # Payload 紧跟在 140 字节头后面
-    #         json_start = header_size
-    #         # 使用 data_len 截取，防止末尾有填充脏数据
-    #         json_bytes = data[json_start : json_start + data_len]
-            
-    #         # 4. 转换字符串
-    #         res_method = method.strip(b'\x00').decode('utf-8', errors='ignore')
-    #         res_url = url.strip(b'\x00').decode('utf-8', errors='ignore')
-            
-    #         # 打印解析出的头部信息以便调试
-    #         print(f"\n[+] 内部头解析成功:")
-    #         print(f"    | rcpId: {rcp_id} | 状态: {num}/{total} | 载荷长度: {data_len}")
-    #         print(f"    | 方法: {res_method} | 路径: {res_url}")
-
-    #         # 5. 解析并返回 JSON
-    #         try:
-    #             return json.loads(json_bytes.decode('utf-8'))
-    #         except json.JSONDecodeError:
-    #             return json_bytes.decode('utf-8', errors='ignore')
-
-    #     except Exception as e:
-    #         return f"[!] 解析异常: {e}"
 
     def _unpack_inner_response(self, data):
         """
         结构: URL(128) + Method(6) + rcpId(1) + total(2) + num(1) + dataLen(2) = 140字节
         """
         try:
+            print(f"[*] 底层 Socket 实际收到的总字节数: {len(data)} 字节")
             # 1. 基础长度校验
             header_fmt = f"!{GAP_URL_LEN}s {GAP_METHOD_LEN}s B H B H"
             header_size = struct.calcsize(header_fmt)
@@ -161,9 +105,18 @@ class GapFullClient:
             json_start = header_size
             # 注意安全检查：确保 data 长度足够 data_len
             actual_payload_len = len(data) - json_start
-            read_len = min(data_len, actual_payload_len)
+            # read_len = min(data_len, actual_payload_len)
             
-            json_bytes = data[json_start : json_start + read_len]
+            # json_bytes = data[json_start : json_start + read_len]
+            # 🌟 工业级安全报警：如果收到的实际载荷比 Header 里声明的 data_len 还要短
+            # 说明网络发生了丢片，重组失败！
+            if actual_payload_len < data_len:
+                print(f"[!] 警告: 数据遭遇网络层分片丢失！Header 声明: {data_len} 字节, 实际仅收到: {actual_payload_len} 字节")
+                # 依然强行切出当前拥有的残缺数据，看看截断到哪里了
+                json_bytes = data[json_start:]
+            else:
+                # 完整接收，精准截取
+                json_bytes = data[json_start : json_start + data_len]
             
             # 打印解析出的头部信息以便调试
             print(f"\n[+] 内部头解析成功:")
