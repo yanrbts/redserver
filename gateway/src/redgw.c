@@ -451,7 +451,7 @@ static void init_server(void) {
     redserver.cmd_tid = cmd_start_core();
     xdp_reasm_init();
 
-    if (ws_notify_thread(1000) != 0) {
+    if (wbs_notify_thread(1000) != 0) {
         log_error("Failed to inject telemetry thread!\n");
     }
 }

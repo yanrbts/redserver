@@ -35,6 +35,6 @@ void wbs_stop(void);
  * @return int 0 on successful thread initialization, non-zero system error code on failure.
  * @note   Non-blocking runner. Actively streams JSON metrics over the active WebSocket channel.
  */
-int ws_notify_thread(int interval_ms);
+int wbs_notify_thread(int interval_ms);
 
 #endif

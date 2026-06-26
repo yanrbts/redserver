@@ -5,12 +5,13 @@
  */
 
 #define _GNU_SOURCE
-#include "sys.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+
+#include "sys.h"
 #include "wbs.h"
 #include "redgw.h"
 
@@ -157,7 +158,13 @@ float sys_proc_mem_mb(void) {
     fclose(fp);
 
     /* Get hardware page size (standard is 4096 bytes / 4KB) */
-    long page_size_bytes = sysconf(_SC_PAGESIZE);
+    static long page_size_bytes = 0;
+    if (page_size_bytes == 0) {
+        page_size_bytes = sysconf(_SC_PAGESIZE);
+        if (page_size_bytes <= 0) {
+            page_size_bytes = 4096;
+        }
+    }
     
     /* Convert active resident pages directly to MegaBytes (MB) */
     float rss_mb = ((float)rss_pages * (float)page_size_bytes) / 1024.0f / 1024.0f;

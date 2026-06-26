@@ -103,41 +103,50 @@ static void ws_parse_config(const char *json_str, uint64_t len) {
  * to prevent payload corruption or parsing failures on the Web UI.
  * @param ev Pointer to the active log event context containing metadata and variadic arguments.
  */
-void ws_log_callback(log_Event *ev) {
-    /* Guardrail against invalid or uninitialized log event telemetry */
+static void ws_log_callback(log_Event *ev) {
     if (!ev || !ev->fmt) return;
 
-    /* Stack allocate buffers to eliminate heap fragmentation risks in high-throughput paths */
-    char raw_msg[1024]   = {0};
-    char final_msg[1280] = {0};
-    char escaped_msg[2048] = {0};
-    char json_buf[2560]  = {0};
+    char json_buf[2560];
+    
+    const char json_prefix[] = "{\"type\":\"log\",\"payload\":{\"msg\":\"";
+    const size_t prefix_len = sizeof(json_prefix) - 1;
+    memcpy(json_buf, json_prefix, prefix_len);
 
-    /* Extract and format the raw variadic message payload under a safe variadic copy snapshot */
-    va_list args_copy;
-    va_copy(args_copy, ev->ap);
-    int msg_len = vsnprintf(raw_msg, sizeof(raw_msg) - 1, ev->fmt, args_copy);
-    va_end(args_copy);
-
-    if (msg_len < 0) return;
-
-    /* Map discrete log level integers to structured global string descriptors */
     const char *level_strings[] = { "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL" };
     const char *lvl_str = (ev->level >= 0 && ev->level <= 5) ? level_strings[ev->level] : "UNKNOWN";
 
-    /* Consolidate metadata components: [LEVEL] file:line: raw_message */
-    int final_len = snprintf(final_msg, sizeof(final_msg) - 1, "[%-5s] %s:%d: %s", 
-                             lvl_str, ev->file, ev->line, raw_msg);
-    if (final_len < 0) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm_time;
+    localtime_r(&ts.tv_sec, &tm_time);
 
-    /* Industrial-grade JSON Escape Shield: 
-     * Iteratively sanitize control characters (\n, \r, \t), backslashes, and quotes 
-     * to safeguard the frontend JSON parser against unexpected frame truncation.
+    char time_str[96];
+    snprintf(time_str, sizeof(time_str), "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+             tm_time.tm_year + 1900, tm_time.tm_mon + 1, tm_time.tm_mday,
+             tm_time.tm_hour, tm_time.tm_min, tm_time.tm_sec,
+             (int)(ts.tv_nsec / 1000000));
+
+    char *dst = json_buf + prefix_len;
+    /* Leave enough safety margin at the end of the buffer:
+     * 128 bytes reserved for the closing JSON "}}" and any
+     * potential escape character inflation. */
+    char *max_dst = json_buf + sizeof(json_buf) - 128;
+
+    int meta_len = snprintf(dst, (size_t)(max_dst - dst), "[%s] [%-5s] %s:%d: ", 
+                            time_str, lvl_str, ev->file, ev->line);
+    if (meta_len < 0) return;
+    dst += meta_len;
+
+    char raw_msg[1024];
+    int msg_len = vsnprintf(raw_msg, sizeof(raw_msg) - 1, ev->fmt, ev->ap);
+    if (msg_len < 0) return;
+
+    /* 
+     * Highly optimized escape engine:
+     * Directly escape raw_msg content and append it immediately 
+     * after the metadata for maximum efficiency and minimal memory movement.
      */
-    char *dst = escaped_msg;
-    const char *src = final_msg;
-    const char *max_dst = escaped_msg + sizeof(escaped_msg) - 3; /* Guard room for safe trailing characters */
-
+    const char *src = raw_msg;
     while (*src && dst < max_dst) {
         switch (*src) {
             case '"':  *dst++ = '\\'; *dst++ = '"';  break;
@@ -149,22 +158,20 @@ void ws_log_callback(log_Event *ev) {
         }
         src++;
     }
+
+    /* Core optimization:
+     * No longer need to call snprintf to append the tail.
+     * Use direct pointer manipulation to hardcode the packet trailer.
+     * Extremely fast. */
+    *dst++ = '"';
+    *dst++ = '}';
+    *dst++ = '}';
     *dst = '\0';
 
-    /* Encap the sanitized stream inside a flat single-field JSON tracking object */
-    int json_len = snprintf(json_buf, sizeof(json_buf) - 1,
-        "{"
-          "\"type\":\"log\","
-          "\"payload\":{"
-            "\"msg\":\"%s\""
-          "}"
-        "}",
-        escaped_msg
-    );
+    uint64_t json_len = (uint64_t)(dst - json_buf);
 
-    /* Dispatch telemetry packet via asynchronous raw network layer broadcast */
-    if (json_len > 0 && json_len < (int)sizeof(json_buf)) {
-        wbs_bcast(json_buf, (uint64_t)json_len);
+    if (json_len > 0) {
+        wbs_bcast(json_buf, json_len);
     }
 }
 
@@ -359,14 +366,17 @@ void wbs_stop(void) {
 static void ws_report_system_status(sys_net_ctx *eth1_ctx, sys_net_ctx *eth2_ctx) {
     if (!eth1_ctx || !eth2_ctx) return;
 
-    /* 1. Extract raw data plane statistics */
     float cpu = sys_cpu_usage();
     float mem = sys_proc_mem_mb();
     float eth1_rx = 0.0f, eth1_tx = 0.0f;
     float eth2_rx = 0.0f, eth2_tx = 0.0f;
 
-    sys_net_rate(redserver.dev1, eth1_ctx, &eth1_rx, &eth1_tx);
-    sys_net_rate(redserver.dev2, eth2_ctx, &eth2_rx, &eth2_tx);
+    if (sys_net_rate(redserver.dev1, eth1_ctx, &eth1_rx, &eth1_tx) != 0) {
+        eth1_rx = 0.0f; eth1_tx = 0.0f;
+    }
+    if (sys_net_rate(redserver.dev2, eth2_ctx, &eth2_rx, &eth2_tx) != 0) {
+        eth2_rx = 0.0f; eth2_tx = 0.0f;
+    }
 
     /* Sanitize against non-finite float anomalies */
     cpu     = (cpu < 0.0f || !isfinite(cpu)) ? 0.0f : cpu;
@@ -374,13 +384,18 @@ static void ws_report_system_status(sys_net_ctx *eth1_ctx, sys_net_ctx *eth2_ctx
     eth1_rx = (eth1_rx < 0.0f || !isfinite(eth1_rx)) ? 0.0f : eth1_rx;
     eth2_rx = (eth2_rx < 0.0f || !isfinite(eth2_rx)) ? 0.0f : eth2_rx;
 
-    char fmt_cpu[32], fmt_mem[32], fmt_eth1[32], fmt_eth2[32];
+   /* Physical bandwidth safeguard:
+    * For Gigabit NICs (theoretical max ~125000 KB/s),
+    * if the computed rate exceeds 2x the physical limit (e.g. >250000 KB/s),
+    * treat it as invalid (NIC reset or corrupted data) and reset to zero.
+    */
+    if (eth1_rx > 250000.0f) eth1_rx = 0.0f;
+    if (eth2_rx > 250000.0f) eth2_rx = 0.0f;
+
+    char fmt_cpu[32], fmt_mem[32];
     snprintf(fmt_cpu,  sizeof(fmt_cpu),  "%.2f", cpu);
     snprintf(fmt_mem,  sizeof(fmt_mem),  "%.2f", mem);
-    snprintf(fmt_eth1, sizeof(fmt_eth1), "%.2f", eth1_rx);
-    snprintf(fmt_eth2, sizeof(fmt_eth2), "%.2f", eth2_rx);
 
-    /* 3. Construct Structured cJSON Object Architecture */
     cJSON *root = cJSON_CreateObject();
     if (!root) goto mem_error_abort;
 
@@ -390,29 +405,22 @@ static void ws_report_system_status(sys_net_ctx *eth1_ctx, sys_net_ctx *eth2_ctx
     if (!payload) goto cleanup_fail;
     cJSON_AddItemToObject(root, "payload", payload);
 
-    /* Bind static fields */
-    if (!cJSON_AddStringToObject(payload, "version", "2.4.12-rc3")) goto cleanup_fail;
-    if (!cJSON_AddStringToObject(payload, "gateway_ip", "192.168.211.129")) goto cleanup_fail;
-    if (!cJSON_AddNumberToObject(payload, "gateway_port", 9001)) goto cleanup_fail;
-    
+    if (!cJSON_AddStringToObject(payload, "version", "2.0.1")) goto cleanup_fail;
+    if (!cJSON_AddStringToObject(payload, "gateway_ip", redserver.gw_host)) goto cleanup_fail;
+    if (!cJSON_AddNumberToObject(payload, "gateway_port", redserver.ws_port)) goto cleanup_fail;
     if (!cJSON_AddStringToObject(payload, "cpu_usage",  fmt_cpu))  goto cleanup_fail;
     if (!cJSON_AddStringToObject(payload, "mem_usage",  fmt_mem))  goto cleanup_fail;
-    
     if (!cJSON_AddStringToObject(payload, "black_zone_status", "UP")) goto cleanup_fail;
     if (!cJSON_AddStringToObject(payload, "black_ip", redserver.core_ip ? redserver.core_ip : "0.0.0.0")) goto cleanup_fail;
     if (!cJSON_AddNumberToObject(payload, "black_port", redserver.core_port)) goto cleanup_fail;
-    
     if (!cJSON_AddStringToObject(payload, "eth1_name", redserver.dev1 ? redserver.dev1 : "eth1")) goto cleanup_fail;
-    if (!cJSON_AddStringToObject(payload, "eth1_speed", fmt_eth1)) goto cleanup_fail;
-    
+    if (!cJSON_AddNumberToObject(payload, "eth1_speed", eth1_rx)) goto cleanup_fail;
     if (!cJSON_AddStringToObject(payload, "eth2_name", redserver.dev2 ? redserver.dev2 : "eth2")) goto cleanup_fail;
-    if (!cJSON_AddStringToObject(payload, "eth2_speed", fmt_eth2)) goto cleanup_fail;
+    if (!cJSON_AddNumberToObject(payload, "eth2_speed", eth2_rx)) goto cleanup_fail;
 
-    /* 4. Serialize into unformatted compact stream buffer */
     char *json_raw_str = cJSON_PrintUnformatted(root);
     if (!json_raw_str) goto cleanup_fail;
 
-    /* 5. Transmit data plane packet via WebSocket */
     uint64_t total_len = (uint64_t)strlen(json_raw_str);
     if (total_len > 0) {
         wbs_bcast(json_raw_str, total_len);
@@ -497,7 +505,7 @@ static void *ws_mon_worker(void *arg) {
     return NULL;
 }
 
-int ws_notify_thread(int interval_ms) {
+int wbs_notify_thread(int interval_ms) {
     pthread_t tid;
     pthread_attr_t attr;
 
