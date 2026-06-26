@@ -664,7 +664,6 @@ void xdp_reasm_init(void) {
         reasm_table[i].buffer = &data_pool[i];
     }
 
-    log_info("[REASM] Fragment reassembly engine initialized.");
     log_info("[REASM] Slots: %d, Metadata Size: %zu bytes, Buffer Pool: %zu MB", 
              MAX_REASM_SLOTS, sizeof(reasm_slot_t), 
              (sizeof(reasm_buf_t) * MAX_REASM_SLOTS) / 1024 / 1024);

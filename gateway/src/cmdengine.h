@@ -23,12 +23,14 @@ pthread_t cmd_start_core(void);
  * @return true if logging is enabled, false otherwise.
  */
 bool cmd_islogpkt_enabled(void);
+void cmd_setlogpkt_enabled(bool enabled);
 
 /**
  * @brief Checks if debug mode is currently enabled.
  * @return true if debug mode is enabled, false otherwise.
  */
 bool cmd_isdebug_enabled(void);
+void cmd_setdebug_enabled(bool enabled);
 
 /**
  * @brief Checks if packet capture is currently enabled.

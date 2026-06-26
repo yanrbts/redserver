@@ -15,6 +15,7 @@
 #define CONFIG_DEFAULT_FILE                 "./config.conf"
 #define CONFIG_DEFAULT_PID_FILE             "/var/run/redgw.pid"
 #define CONFIG_READ_LEN                     1024
+#define CONFIG_DEFAULT_HOST                 "0.0.0.0"
 
 struct redgwserver {
     /* General */
@@ -27,15 +28,16 @@ struct redgwserver {
 
     char *gw_host;              /* Gateway IP to bind */
     int gw_port;                /* Gateway UDP port to bind */
+    int ws_port;                /* websocket port */
     char *dev1;                 /* Network interface to bind for raw socket */
-    int dev1_index;            /* Cached ifindex for dev1 */
+    int dev1_index;             /* Cached ifindex for dev1 */
     char *dev2;                 /* Network interface to bind for raw socket */
-    int dev2_index;            /* Cached ifindex for dev2 */
+    int dev2_index;             /* Cached ifindex for dev2 */
     char *core_ip;              /* Core UDP server IP */
     int core_port;              /* Core UDP server port */
     char *auth_ip;              /* Auth server IP */
     int auth_port;              /* Auth server port */
-    uint32_t auth_token;         /* Authentication token for core communication */
+    uint32_t auth_token;        /* Authentication token for core communication */
 
     void *handle;
     udp_conn_t *udpconn;        /* udp connect fd */

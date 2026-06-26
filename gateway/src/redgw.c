@@ -37,6 +37,8 @@
 #include "xdp_pkt_parser.h"
 #include "cmd.h"
 #include "cmdengine.h"
+#include "wbs.h"
+#include "sys.h"
 
 /* Maximum path length for Linux sysctl net parameters */
 #define SYSCTL_PATH_MAX 256
@@ -268,6 +270,11 @@ static void load_config_file(void) {
             if (redserver.gw_port < 0 || redserver.gw_port > 65535) {
                 err = "Invalid UDP port"; goto loaderr;
             }
+        } if (!strcasecmp(first, "wsport")) {
+            redserver.ws_port = atoi(second);
+            if (redserver.ws_port < 0 || redserver.ws_port > 65535) {
+                err = "Invalid WS UDP port"; goto loaderr;
+            }
         } else if (!strcasecmp(first, "gwhost")) {
             free(redserver.gw_host);
             redserver.gw_host = zstrdup(second);
@@ -335,8 +342,9 @@ static void init_server_config(void) {
     redserver.logfile = NULL;
     redserver.daemonize = 0; // Default to daemonize
 
-    redserver.gw_host = NULL;
+    redserver.gw_host = zstrdup(CONFIG_DEFAULT_HOST);
     redserver.gw_port = 0;
+    redserver.ws_port = 0;
     redserver.dev1 = NULL;
     redserver.dev2 = NULL;
     redserver.dev1_index = 0;
@@ -399,6 +407,8 @@ static void init_server(void) {
     const char *iface_black  = redserver.dev1 ? redserver.dev1 : "ens37";
     const char *iface_client = redserver.dev2 ? redserver.dev2 : "ens33";
 
+    wbs_start(redserver.gw_host, redserver.ws_port);
+
     log_info("Initializing kernel network stack tuning for multi-NIC environment...");
     
     if (net_tune_arp_global() < 0 || 
@@ -440,6 +450,10 @@ static void init_server(void) {
     redserver.rawconn = raw_sock_open(redserver.dev2);
     redserver.cmd_tid = cmd_start_core();
     xdp_reasm_init();
+
+    if (ws_notify_thread(1000) != 0) {
+        log_error("Failed to inject telemetry thread!\n");
+    }
 }
 
 void server_cleanup() {
@@ -460,6 +474,7 @@ void server_cleanup() {
     xdp_receiver_stop(&redserver.handle);
     udp_close(redserver.udpconn);
     raw_sock_close(redserver.rawconn);
+    wbs_stop();
 
     log_info("Memory cleaned up successfully");
 }

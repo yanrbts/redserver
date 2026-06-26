@@ -41,12 +41,6 @@ static cmd_engine_t cmdengine = {
     .isdebug = ATOMIC_VAR_INIT(true),   /* Default enabled */
     .ispcap = ATOMIC_VAR_INIT(false),   /* Default disabled */
     .filter_expr = {0}, /* Empty filter by default */
-    // .heart_stats = {
-    //     .active_ports = 0,
-    //     .discovery_count = 0,
-    //     .register_count = 0,
-    //     .heartbeat_count = 0
-    // },
     .reass_stats = {
         .completed = ATOMIC_VAR_INIT(0),
         .timeout = ATOMIC_VAR_INIT(0),
@@ -965,6 +959,14 @@ bool cmd_islogpkt_enabled(void) {
 
 bool cmd_isdebug_enabled(void) {
     return atomic_load(&cmdengine.isdebug);
+}
+
+void cmd_setlogpkt_enabled(bool enabled) {
+    atomic_store(&cmdengine.islogptk, enabled);
+}
+
+void cmd_setdebug_enabled(bool enabled) {
+    atomic_store(&cmdengine.isdebug, enabled);
 }
 
 bool cmd_ispcap_enabled(void) {
