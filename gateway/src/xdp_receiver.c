@@ -17,9 +17,10 @@
 #include "xdp_receiver.h"
 #include "xdp_pkt_parser.h"
 #include "log.h"
+#include "pktpcap.h"
+#include "cmdengine.h"
 
 #ifdef USE_PERF_BUFFER
-/* 🌟 老内核特定：对齐 5.4.18 内核侧外传的 8 字节元数据头 */
 struct packet_metadata {
     uint32_t ifindex;
     uint32_t pkt_len;
@@ -46,9 +47,6 @@ struct xdp_internal_ctx {
 };
 
 #ifdef USE_PERF_BUFFER
-/* =================================================================
- * 🧬 5.4.18 老内核分支：Perf Buffer 专属异步回调与解包代理
- * ================================================================= */
 static void handle_perf_sample(void *ctx, int cpu, void *data, uint32_t data_sz) {
     (void)(cpu); /* 消灭 unused 警告 */
     struct xdp_internal_ctx *ictx = ctx;
@@ -83,9 +81,6 @@ static void handle_perf_lost(void *ctx, int cpu, unsigned long long cnt) {
 }
 
 #else
-/* =================================================================
- * 🚀 高版本内核分支：原生 Ring Buffer 回调代理
- * ================================================================= */
 static int handle_ringbuf_sample(void *ctx, void *data, size_t data_sz) {
     struct xdp_internal_ctx *ictx = ctx;
     struct packet_event *e = data;
@@ -141,14 +136,12 @@ void* xdp_receiver_init(const xdp_receiver_config_t *cfg, xdp_packet_cb cb) {
     }
 
 #ifdef USE_PERF_BUFFER
-    /* 🌟 条件绑定：初始化老内核专属的 pkt_perf_map */
     int map_fd = bpf_object__find_map_fd_by_name(ictx->obj, "pkt_perf_map");
     if (map_fd < 0) goto cleanup;
 
     ictx->pb = perf_buffer__new(map_fd, 8, handle_perf_sample, handle_perf_lost, ictx, NULL);
     if (!ictx->pb) goto cleanup;
 #else
-    /* 🚀 条件绑定：初始化高性能内核专属的 pkt_ringbuf */
     int map_fd = bpf_object__find_map_fd_by_name(ictx->obj, "pkt_ringbuf");
     if (map_fd < 0) goto cleanup;
 
@@ -217,6 +210,10 @@ int xdp_receiver_start(void *ctx) {
         if (ret < 0 && ret != -EINTR) {
             log_error("Buffer polling error: %d\n", ret);
             return ret;
+        }
+
+        if (cmd_ispcap_enabled()) {
+            pcap_mod_poll();
         }
     }
 
