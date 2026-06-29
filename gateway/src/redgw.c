@@ -411,16 +411,16 @@ static void init_server(void) {
 
     log_info("Initializing kernel network stack tuning for multi-NIC environment...");
     
-    if (net_tune_arp_global() < 0 || 
-        net_tune_arp_isolation(iface_black) < 0 || 
-        net_tune_arp_isolation(iface_client) < 0) {
+    // if (net_tune_arp_global() < 0 || 
+    //     net_tune_arp_isolation(iface_black) < 0 || 
+    //     net_tune_arp_isolation(iface_client) < 0) {
         
-        log_warn("Tuning kernel ARP settings failed, maybe file system is read-only.");
-        exit(1);
-    } else {
-        log_info("Kernel ARP isolation successfully initialized: [%s] & [%s] are now isolated.", 
-                 iface_black, iface_client);
-    }
+    //     log_warn("Tuning kernel ARP settings failed, maybe file system is read-only.");
+    //     exit(1);
+    // } else {
+    //     log_info("Kernel ARP isolation successfully initialized: [%s] & [%s] are now isolated.", 
+    //              iface_black, iface_client);
+    // }
 
     redserver.dev1_index = (int)if_nametoindex(iface_black);
     redserver.dev2_index = (int)if_nametoindex(iface_client);

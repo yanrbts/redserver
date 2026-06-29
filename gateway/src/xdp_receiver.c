@@ -1,5 +1,5 @@
 /*
- * XDP Ring Buffer User-space Implementation
+ * XDP Adaptive Buffer User-space Implementation
  * Copyright (c) 2026, Red LRM.
  * Author: [yanruibing]
  * All rights reserved.
@@ -16,9 +16,15 @@
 #include <linux/if_link.h>
 #include "xdp_receiver.h"
 #include "xdp_pkt_parser.h"
-// #include "gap.h"
 #include "log.h"
-// #include "pktpcap.h"
+
+#ifdef USE_PERF_BUFFER
+/* 🌟 老内核特定：对齐 5.4.18 内核侧外传的 8 字节元数据头 */
+struct packet_metadata {
+    uint32_t ifindex;
+    uint32_t pkt_len;
+} __attribute__((packed));
+#endif
 
 /**
  * @struct xdp_internal_ctx
@@ -26,7 +32,11 @@
  */
 struct xdp_internal_ctx {
     struct bpf_object   *obj;       /* Libbpf object handle */
-    struct ring_buffer  *rb;        /* Libbpf ring buffer manager */
+#ifdef USE_PERF_BUFFER
+    struct perf_buffer  *pb;        /* 🌟 5.4.18 内核动态切换为 Perf Buffer 实例 */
+#else
+    struct ring_buffer  *rb;        /* 高版本内核使用原生 Ring Buffer 实例 */
+#endif
     int                  ifindex_A; /* Network interface ID for Black Zone (Interface A) */
     int                  ifindex_B; /* Network interface ID for Client Switch (Interface B) */
     xdp_packet_cb        user_cb;   /* User-defined packet processor */
@@ -35,10 +45,47 @@ struct xdp_internal_ctx {
     bool                 verbose;   /* Toggle for debug logging */
 };
 
-/**
- * @brief Internal proxy callback for the libbpf ring buffer.
- * Translates raw ring buffer samples into packet events.
- */
+#ifdef USE_PERF_BUFFER
+/* =================================================================
+ * 🧬 5.4.18 老内核分支：Perf Buffer 专属异步回调与解包代理
+ * ================================================================= */
+static void handle_perf_sample(void *ctx, int cpu, void *data, uint32_t data_sz) {
+    (void)(cpu); /* 消灭 unused 警告 */
+    struct xdp_internal_ctx *ictx = ctx;
+
+    if (data_sz < sizeof(struct packet_metadata)) {
+        if (ictx->verbose) {
+            log_error("Corrupted perf sample received\n");
+        }
+        return;
+    }
+
+    struct packet_metadata *meta = (struct packet_metadata *)data;
+    unsigned char *raw_pkt = (unsigned char *)data + sizeof(struct packet_metadata);
+
+    /* 100% 投递等价数据给外部用户回调 */
+    if (ictx->user_cb) {
+        ictx->user_cb(ictx->user_ctx, raw_pkt, meta->pkt_len, meta->ifindex);
+    } else {
+        pkt_info_t info = {0};
+        if (xdp_pkt_parse_all(raw_pkt, meta->pkt_len, &info) == 0) {
+            xdp_pkt_dump_log(&info);
+        }
+    }
+}
+
+static void handle_perf_lost(void *ctx, int cpu, unsigned long long cnt) {
+    (void)(cpu); /* 消灭 unused 警告 */
+    struct xdp_internal_ctx *ictx = ctx;
+    if (ictx->verbose) {
+        log_warn("Perf buffer dynamic queue saturation: lost %llu events\n", cnt);
+    }
+}
+
+#else
+/* =================================================================
+ * 🚀 高版本内核分支：原生 Ring Buffer 回调代理
+ * ================================================================= */
 static int handle_ringbuf_sample(void *ctx, void *data, size_t data_sz) {
     struct xdp_internal_ctx *ictx = ctx;
     struct packet_event *e = data;
@@ -62,6 +109,7 @@ static int handle_ringbuf_sample(void *ctx, void *data, size_t data_sz) {
     }
     return 0;
 }
+#endif
 
 void* xdp_receiver_init(const xdp_receiver_config_t *cfg, xdp_packet_cb cb) {
     if (!cfg || !cfg->bpf_obj_path || !cfg->ifname_A || !cfg->ifname_B) {
@@ -92,25 +140,28 @@ void* xdp_receiver_init(const xdp_receiver_config_t *cfg, xdp_packet_cb cb) {
         goto cleanup;
     }
 
-    /* Locate the ringbuf map by name defined in the C code */
+#ifdef USE_PERF_BUFFER
+    /* 🌟 条件绑定：初始化老内核专属的 pkt_perf_map */
+    int map_fd = bpf_object__find_map_fd_by_name(ictx->obj, "pkt_perf_map");
+    if (map_fd < 0) goto cleanup;
+
+    ictx->pb = perf_buffer__new(map_fd, 8, handle_perf_sample, handle_perf_lost, ictx, NULL);
+    if (!ictx->pb) goto cleanup;
+#else
+    /* 🚀 条件绑定：初始化高性能内核专属的 pkt_ringbuf */
     int map_fd = bpf_object__find_map_fd_by_name(ictx->obj, "pkt_ringbuf");
     if (map_fd < 0) goto cleanup;
 
-    /* Initialize the ring buffer manager with the internal context as user data */
     ictx->rb = ring_buffer__new(map_fd, handle_ringbuf_sample, ictx, NULL);
     if (!ictx->rb) goto cleanup;
+#endif
 
-    /* KEY POINT: Attach the XDP program to the network interface.
-       Using XDP_FLAGS_SKB_MODE for generic compatibility; use 0 for native driver support. */
+    /* KEY POINT: Attach the XDP program to the network interface. */
     struct bpf_program *prog = bpf_object__find_program_by_name(ictx->obj, "xdp_packet_capture");
     if (!prog) goto cleanup;
     int prog_fd = bpf_program__fd(prog);
 
-    /* 🌟 智能流控挂载矩阵 */
     if (ictx->ifindex_A == ictx->ifindex_B) {
-        /* ==========================================================
-         * 🟢 单网卡复合模式 (Single-NIC Mode)
-         * ========================================================== */
         if (bpf_xdp_attach(ictx->ifindex_A, prog_fd, XDP_FLAGS_SKB_MODE, NULL) < 0) {
             log_error("Failed to attach XDP capture hook in Single-NIC mode on %s", cfg->ifname_A);
             goto cleanup;
@@ -120,9 +171,6 @@ void* xdp_receiver_init(const xdp_receiver_config_t *cfg, xdp_packet_cb cb) {
                      cfg->ifname_A, ictx->ifindex_A);
         }
     } else {
-        /* ==========================================================
-         * 🔵 双网卡独立模式 (Dual-NIC Mode)
-         * ========================================================== */
         if (bpf_xdp_attach(ictx->ifindex_A, prog_fd, XDP_FLAGS_SKB_MODE, NULL) < 0) {
             log_error("Failed to attach XDP capture hook to Interface A (%s)", cfg->ifname_A);
             goto cleanup;
@@ -140,7 +188,11 @@ void* xdp_receiver_init(const xdp_receiver_config_t *cfg, xdp_packet_cb cb) {
     return ictx;
 
 cleanup:
+#ifdef USE_PERF_BUFFER
+    if (ictx->pb) perf_buffer__free(ictx->pb);
+#else
     if (ictx->rb) ring_buffer__free(ictx->rb);
+#endif
     if (ictx->obj) bpf_object__close(ictx->obj);
     free(ictx);
     return NULL;
@@ -152,20 +204,20 @@ int xdp_receiver_start(void *ctx) {
 
     ictx->running = true;
     if (ictx->verbose) {
-        log_info("Starting XDP receiver loop on ifindex %d...");
+        log_info("Starting XDP receiver loop...");
     }
 
     /* KEY POINT: Main execution loop using non-blocking poll with 100ms timeout */
     while (ictx->running) {
+#ifdef USE_PERF_BUFFER
+        int ret = perf_buffer__poll(ictx->pb, 100);
+#else
         int ret = ring_buffer__poll(ictx->rb, 100);
+#endif
         if (ret < 0 && ret != -EINTR) {
-            log_error("Ring buffer polling error: %d\n", ret);
+            log_error("Buffer polling error: %d\n", ret);
             return ret;
         }
-
-        // if (cmd_ispcap_enabled()) {
-        //     pcap_mod_poll();
-        // }
     }
 
     return 0;
@@ -174,7 +226,6 @@ int xdp_receiver_start(void *ctx) {
 void xdp_receiver_exit(void *ctx) {
     struct xdp_internal_ctx *ictx = ctx;
     if (ictx) {
-        /* KEY POINT: Thread-safe flag modification to break the while-loop in start() */
         ictx->running = false;
     }
 }
@@ -183,20 +234,24 @@ void xdp_receiver_stop(void **ctx_ptr) {
     if (!ctx_ptr || !*ctx_ptr) return;
     struct xdp_internal_ctx *ictx = *ctx_ptr;
 
-    /* Set running to false just in case exit() wasn't called */
     ictx->running = false;
 
-    /* KEY POINT: Orderly resource cleanup to prevent kernel resource leaks */
+    /* KEY POINT: Orderly resource cleanup based on kernel feature macro */
+#ifdef USE_PERF_BUFFER
+    if (ictx->pb) {
+        perf_buffer__free(ictx->pb);
+    }
+#else
     if (ictx->rb) {
         ring_buffer__free(ictx->rb);
     }
+#endif
 
     /* 🌟 智能解绑自愈：防止相同 ifindex 重复解绑 */
     if (ictx->ifindex_A > 0) {
         bpf_xdp_detach(ictx->ifindex_A, XDP_FLAGS_SKB_MODE, NULL);
     }
     
-    // 只有在双网卡模式下，且 B 网卡有效时，才解绑 B 网卡
     if (ictx->ifindex_A != ictx->ifindex_B && ictx->ifindex_B > 0) {
         bpf_xdp_detach(ictx->ifindex_B, XDP_FLAGS_SKB_MODE, NULL);
     }
@@ -206,7 +261,7 @@ void xdp_receiver_stop(void **ctx_ptr) {
     }
 
     free(ictx);
-    *ctx_ptr = NULL; /* Prevent dangling pointers in the caller */
+    *ctx_ptr = NULL; 
     
     log_info("XDP receiver resource cleanup complete");
 }

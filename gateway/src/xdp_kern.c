@@ -10,8 +10,27 @@
 #define MAX_PACKET_DATA 2048
 #define TARGET_UDP_DST_PORT 52719
 
+#ifdef USE_PERF_BUFFER
+/* =================================================================
+ * 🧬 5.4.18 老内核方案：Perf Buffer 拓扑
+ * ================================================================= */
+struct packet_metadata {
+    __u32 ifindex; 
+    __u32 pkt_len;
+} __attribute__((packed));
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(key_size, sizeof(int));
+    __uint(value_size, sizeof(int));
+} pkt_perf_map SEC(".maps");
+
+#else
+/* =================================================================
+ * 🚀 高版本内核方案：Ring Buffer 拓扑
+ * ================================================================= */
 struct packet_event {
-    __u32 ifindex;             /* Ingress network interface ID (e.g., card A or card B) */
+    __u32 ifindex;
     __u32 pkt_len;
     __u8  data[MAX_PACKET_DATA];
 } __attribute__((packed));
@@ -20,6 +39,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 24); 
 } pkt_ringbuf SEC(".maps");
+#endif
 
 SEC("xdp")
 int xdp_packet_capture(struct xdp_md *ctx) {
@@ -35,42 +55,59 @@ int xdp_packet_capture(struct xdp_md *ctx) {
 
     // 1. 提取分片信息
     __u16 frag_off = bpf_ntohs(ip->frag_off);
-    bool is_fragment = (frag_off & 0x3FFF) != 0; // MF位或Offset不为0
+    bool is_fragment = (frag_off & 0x3FFF) != 0; 
 
     // 2. 如果不是 UDP 且也不是分片，直接放行
     if (ip->protocol != IPPROTO_UDP && !is_fragment) {
         return XDP_PASS;
     }
 
-    // 3. 端口检查逻辑（仅针对非分片包，或者分片的首片）
+    // 3. 端口检查逻辑
     if (!is_fragment || (is_fragment && (frag_off & 0x1FFF) == 0)) {
         __u32 ip_hdr_len = ip->ihl * 4;
+        
+        #ifdef USE_PERF_BUFFER
+        /* 5.4 内核验证器边界防护强化 */
+        if ((void *)ip + ip_hdr_len > data_end) return XDP_PASS;
+        #endif
+
         if ((void *)ip + ip_hdr_len + sizeof(struct udphdr) > data_end) {
-            // 如果是首片但长度不够看 UDP 头，可能包坏了，如果是普通包则放行
             if (!is_fragment) return XDP_PASS;
         } else {
             struct udphdr *udp = (void *)ip + ip_hdr_len;
-            // 如果端口不匹配，且不是分片，才放行
             if (bpf_ntohs(udp->dest) != TARGET_UDP_DST_PORT && !is_fragment) {
                 return XDP_PASS;
             }
         }
     }
 
-    // 4. 只要是分片包，或者匹配端口的 UDP 包，全部送往 RingBuffer
+    // 4. 数据打包捕获流
     __u32 pkt_len = (__u32)(data_end - data);
+
+#ifdef USE_PERF_BUFFER
+    /* 🌟 5.4 内核分支：利用特化 flags 触发硬件级 DMA 传输 */
+    __u32 capture_len = pkt_len > MAX_PACKET_DATA ? MAX_PACKET_DATA : pkt_len;
+    struct packet_metadata meta;
+    meta.ifindex = ctx->ingress_ifindex;
+    meta.pkt_len = pkt_len;
+
+    __u64 flags = ((__u64)capture_len << 32) | BPF_F_CURRENT_CPU;
+    int ret = bpf_perf_event_output(ctx, &pkt_perf_map, flags, &meta, sizeof(meta));
+    if (ret < 0) return XDP_PASS;
+#else
+    /* 🚀 高版本内核分支：原汁原味 Ringbuf 预留提交 */
     struct packet_event *event = bpf_ringbuf_reserve(&pkt_ringbuf, sizeof(struct packet_event), 0);
     if (!event) return XDP_PASS;
 
     event->ifindex = ctx->ingress_ifindex;
-    
     if (pkt_len > MAX_PACKET_DATA) pkt_len = MAX_PACKET_DATA;
     event->pkt_len = pkt_len;
     
-    // 使用简单的拷贝
     bpf_probe_read_kernel(event->data, MAX_PACKET_DATA, data);
     bpf_ringbuf_submit(event, 0);
+#endif
 
     return XDP_DROP;
 }
+
 char _license[] SEC("license") = "GPL";

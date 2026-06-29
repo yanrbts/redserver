@@ -1,6 +1,6 @@
 CC       := gcc
 CFLAGS   := -Wall -Wextra -O2 -g -I. -I../src
-LDFLAGS  :=
+LDFLAGS  := -lpthread
 LIBS     :=
 
 BIN_DIR  := ../bin
@@ -23,7 +23,7 @@ all: $(TARGET)
 
 $(TARGET): $(OBJS) | $(BIN_DIR)
 	@echo "[LINK] Creating executable: $@"
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS) $(LDFLAGS) 
 	@echo "[SUCCESS] Build complete!"
 
 $(BIN_DIR):

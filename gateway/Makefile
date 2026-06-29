@@ -1,70 +1,73 @@
 # =================================================================
 # Copyright (c) 2026-2026, Red LRM.
 # Description: High-Performance XDP Combined Makefile with LDFLAGS
-#              Supports deep discovery for src/ws/ subdirectory
+#              Intelligent Kernel Version Routing (5.x -> Perf, 6.x+ -> Ring)
+# Author: [yanruibing]
 # =================================================================
 
-# 1. 编译器及工具链定义
+# 1. 基础配置
 CC       := gcc
 CLANG    := clang
 TARGET   := bin/redgw
 XDP_OBJ  := obj/xdp_kern.o
 
-# 2. 编译与链接选项配置
-CFLAGS   := -ggdb -O3 -DLOG_USE_COLOR -Wall -Wextra -pthread -Iinclude -Isrc -Isrc/ws
-BPFFLAGS := -O2 -target bpf -g -Wall
-
-# 核心升级：引入用户态所需的全部高吞吐/内核依赖链接库
-LDFLAGS  := -lpthread -lbpf -lelf -lz -lm -lpcap
-
-# 3. 目录与路径发现机制
 SRC_DIR  := src
 OBJ_DIR  := obj
 BIN_DIR  := bin
 CLI_DIR  := cli
 
-# 🌟 核心修改 1：利用 wildcard 同时搜寻 src/ 和 src/ws/ 下的所有 .c 文件
+# 2. 自动化内核主版本提取与路由
+KERNEL_VERSION := $(shell uname -r)
+# 提取主版本号（例如 "5.4.18-xxx" -> "5", "6.1.0-xxx" -> "6"）
+KERNEL_MAJOR   := $(shell uname -r | cut -d. -f1)
+
+# 默认编译基础参数
+CFLAGS   := -ggdb -O3 -DLOG_USE_COLOR -Wall -Wextra -pthread -Iinclude -Isrc -Isrc/ws
+BPFFLAGS := -O2 -target bpf -g -Wall
+# LDFLAGS  := -lpthread -lbpf -lelf -lz -lm -lpcap
+
+# 🌟 核心修改 1：追加 -L/lib64 和 -L/usr/lib64 强行让 GCC 链接器去麒麟的 64 位库路径下搜寻 .so 文件
+# 🌟 核心修改 2：追加 -Wl,-rpath 选项，把这些路径硬编码进生成的二进制文件中，这样运行时就不需要配 LD_LIBRARY_PATH 了！
+LDFLAGS  := -L/lib64 -L/usr/lib64 -Wl,-rpath=/lib64:/usr/lib64 -lpthread -lbpf -lelf -lz -lm -lpcap
+
+# 🌟 核心修改：判定只要主版本号是 5（或更低），就强行启用 USE_PERF_BUFFER 降级兼容策略
+ifeq ($(KERNEL_MAJOR),5)
+    $(info [SYS-DETECT] Linux Kernel $(KERNEL_VERSION) [Major: $(KERNEL_MAJOR)] -> [Enabling USE_PERF_BUFFER])
+    # 双向注入用户态与内核态宏定义
+    CFLAGS   += -DUSE_PERF_BUFFER
+    BPFFLAGS += -DUSE_PERF_BUFFER -I/usr/include/$(shell uname -m)-linux-gnu -I/usr/local/include
+else
+    $(info [SYS-DETECT] Linux Kernel $(KERNEL_VERSION) [Major: $(KERNEL_MAJOR)] -> [Enabling Standard RINGBUF])
+endif
+
+# 3. 动态扫描过滤用户态源码
 ALL_SRCS  := $(wildcard $(SRC_DIR)/*.c) $(wildcard $(SRC_DIR)/ws/*.c)
-
-# 🌟 核心修改 2：排除掉 XDP 内核代码，剩下的就是纯正的用户态/业务态源码
 USER_SRCS := $(filter-out $(SRC_DIR)/xdp_kern.c, $(ALL_SRCS))
-
-# 🌟 核心修改 3：将用户态源码平移映射到 obj/ 目录下（保留其原有的 ws/ 子目录结构）
 USER_OBJS := $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(USER_SRCS))
 
-# 4. 伪目标定义
 .PHONY: all clean directories build_cli
 
-# 默认构建流
 all: directories $(XDP_OBJ) $(TARGET) build_cli
 
-# 5. 目录自动创建规则
-# 🌟 核心修改 4：创建 obj/ 的同时，必须强行把 obj/ws/ 子目录一并建好，否则生成 .o 时会报错
 directories:
 	@mkdir -p $(OBJ_DIR)
 	@mkdir -p $(OBJ_DIR)/ws
 	@mkdir -p $(BIN_DIR)
 
-# 6. 用户态可执行文件链接规则
 $(TARGET): $(USER_OBJS)
-	@echo "[+] Linking User-Plane Binary with Dependencies: $@"
+	@echo "[+] Linking User-Plane Binary: $@"
 	@$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-# 7. 用户态 .c 到 .o 的编译规则 (🌟 核心修改 5：通过目录通配符，完美兼容 src/ 和 src/ws/ 里的所有规则)
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
 	@echo "[+] Compiling User-Plane Object: $<"
 	@$(CC) $(CFLAGS) -c $< -o $@
 
-# 8. XDP/eBPF 内核字节码编译规则
 $(XDP_OBJ): $(SRC_DIR)/xdp_kern.c
-	@echo "[*] Compiling XDP Kernel Bytecode: $<"
+	@echo "[*] Compiling Adaptive XDP Kernel Bytecode: $<"
 	@$(CLANG) $(BPFFLAGS) -c $< -o $@
 
 build_cli:
-	@echo "[SUBDIR] Entering directory '$(CLI_DIR)' for build..."
 	$(MAKE) -C $(CLI_DIR)
 
-# 9. 清理规则
 clean:
-	@echo "[!] Cleaning Build Workspace..."
 	@rm -rf $(OBJ_DIR) $(BIN_DIR)
