@@ -34,9 +34,9 @@ struct packet_metadata {
 struct xdp_internal_ctx {
     struct bpf_object   *obj;       /* Libbpf object handle */
 #ifdef USE_PERF_BUFFER
-    struct perf_buffer  *pb;        /* 🌟 5.4.18 内核动态切换为 Perf Buffer 实例 */
+    struct perf_buffer  *pb;
 #else
-    struct ring_buffer  *rb;        /* 高版本内核使用原生 Ring Buffer 实例 */
+    struct ring_buffer  *rb;
 #endif
     int                  ifindex_A; /* Network interface ID for Black Zone (Interface A) */
     int                  ifindex_B; /* Network interface ID for Client Switch (Interface B) */
@@ -48,7 +48,7 @@ struct xdp_internal_ctx {
 
 #ifdef USE_PERF_BUFFER
 static void handle_perf_sample(void *ctx, int cpu, void *data, uint32_t data_sz) {
-    (void)(cpu); /* 消灭 unused 警告 */
+    (void)(cpu);
     struct xdp_internal_ctx *ictx = ctx;
 
     if (data_sz < sizeof(struct packet_metadata)) {
@@ -61,7 +61,6 @@ static void handle_perf_sample(void *ctx, int cpu, void *data, uint32_t data_sz)
     struct packet_metadata *meta = (struct packet_metadata *)data;
     unsigned char *raw_pkt = (unsigned char *)data + sizeof(struct packet_metadata);
 
-    /* 100% 投递等价数据给外部用户回调 */
     if (ictx->user_cb) {
         ictx->user_cb(ictx->user_ctx, raw_pkt, meta->pkt_len, meta->ifindex);
     } else {
@@ -73,7 +72,7 @@ static void handle_perf_sample(void *ctx, int cpu, void *data, uint32_t data_sz)
 }
 
 static void handle_perf_lost(void *ctx, int cpu, unsigned long long cnt) {
-    (void)(cpu); /* 消灭 unused 警告 */
+    (void)(cpu);
     struct xdp_internal_ctx *ictx = ctx;
     if (ictx->verbose) {
         log_warn("Perf buffer dynamic queue saturation: lost %llu events\n", cnt);
@@ -81,6 +80,7 @@ static void handle_perf_lost(void *ctx, int cpu, unsigned long long cnt) {
 }
 
 #else
+
 static int handle_ringbuf_sample(void *ctx, void *data, size_t data_sz) {
     struct xdp_internal_ctx *ictx = ctx;
     struct packet_event *e = data;
@@ -244,7 +244,6 @@ void xdp_receiver_stop(void **ctx_ptr) {
     }
 #endif
 
-    /* 🌟 智能解绑自愈：防止相同 ifindex 重复解绑 */
     if (ictx->ifindex_A > 0) {
         bpf_xdp_detach(ictx->ifindex_A, XDP_FLAGS_SKB_MODE, NULL);
     }

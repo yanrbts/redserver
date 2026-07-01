@@ -70,30 +70,49 @@ static void ws_parse_config(const char *json_str, uint64_t len) {
         cJSON *payload = cJSON_GetObjectItemCaseSensitive(root, "payload");
         if (payload && cJSON_IsObject(payload)) {
             
-            /* 4. Extract telemetry boolean switches into local stack variables */
-            cJSON *isdebug_node    = cJSON_GetObjectItemCaseSensitive(payload, "isdebug");
+            /* 4. Extract telemetry nodes from payload */
+            cJSON *isdebug_node   = cJSON_GetObjectItemCaseSensitive(payload, "isdebug");
             cJSON *islogpkt_node  = cJSON_GetObjectItemCaseSensitive(payload, "islogpkt");
-            cJSON *forward_node = cJSON_GetObjectItemCaseSensitive(payload, "forward_debug");
-            cJSON *gen_log_node = cJSON_GetObjectItemCaseSensitive(payload, "general_log");
+            cJSON *iscapture_node = cJSON_GetObjectItemCaseSensitive(payload, "iscapture");
+            cJSON *ifname_node    = cJSON_GetObjectItemCaseSensitive(payload, "capture_interface");
+            cJSON *filter_node    = cJSON_GetObjectItemCaseSensitive(payload, "packet_filter");
 
-            int local_debug   = cJSON_IsBool(isdebug_node)    ? cJSON_IsTrue(isdebug_node) : 0;
+            /* 5. Direct translation to primitives with explicit type verification */
+            int local_debug   = cJSON_IsBool(isdebug_node)   ? cJSON_IsTrue(isdebug_node) : 0;
             int local_logpkt  = cJSON_IsBool(islogpkt_node)  ? cJSON_IsTrue(islogpkt_node) : 0;
-            int local_forward = cJSON_IsBool(forward_node) ? cJSON_IsTrue(forward_node) : 0;
-            int local_gen_log = cJSON_IsBool(gen_log_node) ? cJSON_IsTrue(gen_log_node) : 0;
+            int local_capture = cJSON_IsBool(iscapture_node) ? cJSON_IsTrue(iscapture_node) : 0;
 
-            /* 5. Direct Industrial high-visibility telemetry dump on console */
+            char safe_ifname[32] = {0};
+            char safe_filter[256] = {0};
+
+            if (cJSON_IsString(ifname_node) && ifname_node->valuestring != NULL) {
+                strncpy(safe_ifname, ifname_node->valuestring, sizeof(safe_ifname) - 1);
+            } else {
+                strncpy(safe_ifname, "eth1", sizeof(safe_ifname) - 1); // 兜底默认网卡
+            }
+
+            if (cJSON_IsString(filter_node) && filter_node->valuestring != NULL) {
+                strncpy(safe_filter, filter_node->valuestring, sizeof(safe_filter) - 1);
+            } else {
+                safe_filter[0] = '\0';
+            }
+
+            /* 6. Direct Industrial high-visibility telemetry dump on console */
             log_info("[KERNEL CONFIG] Received Frontend Control Flow Optimizations");
             log_info("[Debug Tracking]  -> %s", local_debug   ? "ENABLED" : "DISABLED");
             log_info("[XDP Reassembly]  -> %s", local_logpkt  ? "ENABLED" : "DISABLED");
-            log_info("[Producer-Buffer Flow] -> %s", local_forward ? "ENABLED" : "DISABLED");
-            log_info("[General System Logs]  -> %s", local_gen_log ? "ENABLED" : "DISABLED");
+            log_info("[PCAP Capture ]  -> %s", local_capture  ? "ENABLED" : "DISABLED");
+            log_info("[Interface    ]  -> %s", safe_ifname);
+            log_info("[BPF Filter   ]  -> \"%s\"", safe_filter);
 
+            /* 7. Atomically apply or commit states to data-plane engines */
             cmd_setdebug_enabled(local_debug ? true : false);
             cmd_setlogpkt_enabled(local_logpkt ? true : false);
+            cmd_setpcap_enabled(local_capture ? true : false, safe_ifname, safe_filter);
         }
     }
 
-    /* 6. Enforce strict heap reclamation to avoid critical memory leakage */
+    /* 8. Enforce strict heap reclamation to avoid critical memory leakage */
     cJSON_Delete(root);
 }
 
@@ -464,11 +483,16 @@ static void ws_report_live_config(void) {
 
     bool is_logpkt = cmd_islogpkt_enabled();
     bool is_debug  = cmd_isdebug_enabled();
+    bool is_capture = cmd_ispcap_enabled();
+    bool is_eth1 = cmd_iseth1_enabled();
+    char filter[256] = {0};
+    cmd_get_pcap_filter_safe(filter, sizeof(filter));
 
     cJSON_AddBoolToObject(payload, "isdebug", is_debug);      /* Map debug tracking state */
     cJSON_AddBoolToObject(payload, "islogpkt", is_logpkt);    /* Map packet reassembly state */
-    cJSON_AddBoolToObject(payload, "forward_debug", false);   /* Placeholder/Default placeholder */
-    cJSON_AddBoolToObject(payload, "general_log", false);     /* Sync standard system log toggle */
+    cJSON_AddBoolToObject(payload, "iscapture", is_capture);   /* Placeholder/Default placeholder */
+    cJSON_AddStringToObject(payload, "capture_interface", is_eth1 ? "eth1" : "eth2");     /* Sync standard system log toggle */
+    cJSON_AddStringToObject(payload, "packet_filter", filter);     /* Sync standard system log toggle */
 
     /* 5. Serialize cJSON structure into unformatted, compact raw string sequence */
     char *json_raw_str = cJSON_PrintUnformatted(root);

@@ -37,6 +37,9 @@ void cmd_setdebug_enabled(bool enabled);
  * @return true if packet capture is enabled, false otherwise.
  */
 bool cmd_ispcap_enabled(void);
+bool cmd_iseth1_enabled(void);
+int cmd_get_pcap_filter_safe(char *buf, size_t max_len);
+void cmd_setpcap_enabled(bool enabled, const char *ifname, const char *filter);
 
 /**
  * @brief Increments the reassembly statistics counters in a thread-safe manner.

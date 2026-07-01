@@ -15,11 +15,8 @@
 #include <stdatomic.h>
 
 #include "util.h"
-// #include "gap.h"
 #include "log.h"
-// #include "xdp_receiver.h"
 #include "xdp_pkt_parser.h"
-// #include "pkteng.h"
 #include "cmdengine.h"
 #include "pktpcap.h"
 #include "hdr.h"
@@ -133,7 +130,7 @@ static reasm_stats_t global_stats;
  * @param ip Pointer to the IPv4 header of the current fragment.
  * @return reasm_slot_t* Pointer to the assigned slot, or NULL if the table is full.
  */
-static reasm_slot_t* xdp_get_reasm_slot(struct iphdr *ip) {
+static reasm_slot_t* xdp_get_reasm_slot(const struct iphdr *ip) {
     uint16_t id_h = ntohs(ip->id);
     /* Generate a simple hash using the IPv4 4-tuple (Src, Dst, ID, Proto) */
     uint32_t hash = (ip->saddr ^ ip->daddr ^ id_h ^ ip->protocol) % MAX_REASM_SLOTS;
@@ -181,27 +178,76 @@ static reasm_slot_t* xdp_get_reasm_slot(struct iphdr *ip) {
 }
 
 /**
- * @brief Checks and sets bits in the bitmap, detecting overlaps.
- * @return true if an overlap is detected, false otherwise.
+ * Tracks fragment spans and detects parallel skb_clone twins.
+ * @bitmap:        Pointer to the connection slot bit-array.
+ * @offset:        Fragment offset in bytes.
+ * @len:           Length of the fragment payload in bytes.
+ * @is_clone:      [Out] Evaluated true if packet is a strict physical mirror.
+ * * Return: True if an erratic, asymmetrical overlapping attack/anomaly is found.
+ * False if the range is successfully registered or identified as a clean clone.
  */
-static inline bool set_bitmap_range(uint64_t *bitmap, uint32_t offset, uint32_t len) {
-    uint32_t start_bit = offset / FRAG_UNIT;
-    uint32_t num_bits = (len + FRAG_UNIT - 1) / FRAG_UNIT;
-    bool overlap = false;
-
-    for (uint32_t i = 0; i < num_bits; i++) {
-        uint32_t bit = start_bit + i;
-        uint32_t byte_idx = bit / 64;
-        uint64_t bit_mask = (1ULL << (bit % 64));
-
-        /* Detect if this block has already been filled */
-        if (bitmap[byte_idx] & bit_mask) {
-            overlap = true;
-        }
-        /* Mark the block as received */
-        bitmap[byte_idx] |= bit_mask;
+static inline bool set_bitmap_range(uint64_t *bitmap, uint32_t offset, uint32_t len, bool *is_clone) {
+    /* 8-byte alignment granularity constraint (FRAG_UNIT = 8) */
+    uint32_t start_bit = offset >> 3;
+    uint32_t num_bits  = (len + 7) >> 3;
+    
+    if (unlikely(num_bits == 0)) {
+        if (is_clone) *is_clone = false;
+        return false;
     }
-    return overlap;
+
+    uint32_t end_bit   = start_bit + num_bits;
+    uint32_t start_idx = start_bit / 64;
+    uint32_t end_idx   = (end_bit - 1) / 64;
+
+    /* Fail-safe out-of-bounds containment */
+    if (unlikely(end_idx >= BITMAP_U64_COUNT)) {
+        return true; 
+    }
+
+    if (is_clone) *is_clone = false;
+
+    bool has_new_bits = false;
+    bool has_old_bits = false;
+
+    /* Loop through affected u64 array blocks instead of stepping bit-by-bit */
+    for (uint32_t idx = start_idx; idx <= end_idx; idx++) {
+        uint32_t bit_s = (idx == start_idx) ? (start_bit % 64) : 0;
+        uint32_t bit_e = (idx == end_idx) ? ((end_bit - 1) % 64) : 63;
+
+        /* Formulate a precise fast execution block bit-mask for the span range */
+        uint64_t mask = (~0ULL >> (63 - (bit_e - bit_s))) << bit_s;
+        uint64_t current_val = bitmap[idx];
+
+        if ((current_val & mask) != 0) {
+            has_old_bits = true;
+        }
+        if ((current_val & mask) != mask) {
+            has_new_bits = true;
+        }
+    }
+
+    /* Evaluate network tracking state based on bit intersection */
+    if (unlikely(has_old_bits)) {
+        /* Condition A: Perfect overlapping match -> Promiscuous mode skb_clone mirror */
+        if (!has_new_bits) {
+            if (is_clone) *is_clone = true;
+            return false; 
+        }
+        /* Condition B: Partial intersection -> Asymmetric overlap attack vector detected */
+        return true; 
+    }
+
+    /* Happy Path: Commit non-allocating bitmask write states directly to the slot registry */
+    for (uint32_t idx = start_idx; idx <= end_idx; idx++) {
+        uint32_t bit_s = (idx == start_idx) ? (start_bit % 64) : 0;
+        uint32_t bit_e = (idx == end_idx) ? ((end_bit - 1) % 64) : 63;
+        uint64_t mask = (~0ULL >> (63 - (bit_e - bit_s))) << bit_s;
+        
+        bitmap[idx] |= mask;
+    }
+
+    return false;
 }
 
 /* Helper to check if all bits up to total_len are set */
@@ -222,85 +268,117 @@ static inline bool is_bitmap_complete(uint64_t *bitmap, uint32_t total_len) {
 }
 
 /**
- * @brief Performs IPv4 fragment reassembly using a bitmap to track data continuity.
- * This function processes an individual IP fragment, copies it into a 
- * reassembly buffer, and marks the corresponding bits in a bitmap. 
- * Once the bitmap is fully filled (from Offset 0 to Expected Total Length), 
- * the datagram is considered complete.
+ * Performs stateful lockless reassembly of fragmented IP packets.
+ * @data:   Pointer to the start of the raw Ethernet frame buffer.
+ * @len:    Total length of the received link-layer frame.
+ * @info:   Output structure populated with payload pointers upon complete reassembly.
  *
- * @param data Pointer to the raw packet (Ethernet header start).
- * @param len  Total length of the received frame.
- * @param info Pointer to the packet info structure to be populated upon success.
- * @return int 1 if reassembly is complete; 0 if still in progress; -1 on error.
+ * Return:  1  = Assembly complete; payload ready for next-stage processing.
+ * 0  = Fragment processed successfully, awaiting outstanding sequences.
+ * -1  = Error encountered (OOB, overlap anomaly, or structural breach).
  */
-static int xdp_do_reasm(const uint8_t *data, size_t len, pkt_info_t *info) {
+int xdp_do_reasm(const uint8_t *data, size_t len, pkt_info_t *info) {
     (void)len;
 
-    struct iphdr *ip = (struct iphdr *)(data + ETH_HLEN);
-    uint32_t ip_hdr_len = ip->ihl * 4;
-    uint16_t frag_off_raw = ntohs(ip->frag_off);
+    const uint64_t now = get_now_ms();
+    const struct iphdr *ip = (const struct iphdr *)(data + ETH_HLEN);
     
-    uint32_t offset = (frag_off_raw & IP_OFFSET_MASK) * FRAG_UNIT;
-    uint32_t p_len = ntohs(ip->tot_len) - ip_hdr_len;
-    bool mf = !!(frag_off_raw & IP_MF_FLAG);
+    const uint16_t f_off_raw = ntohs(ip->frag_off);
+    const uint32_t offset = (f_off_raw & IP_OFFSET_MASK) << 3; /* Multiplied by 8 */
+    const bool mf = !!(f_off_raw & IP_MF_FLAG);
+    
+    const uint32_t ip_hdr_len = ip->ihl << 2; /* Multiplied by 4 */
+    const uint32_t p_len = ntohs(ip->tot_len) - ip_hdr_len;
 
-    reasm_slot_t *slot = xdp_get_reasm_slot(ip);
-    if (!slot) return -1;
-
-    /* Boundary Check: Prevent buffer overflow */
+    /* Out-of-bounds sanity constraint to block memory layout manipulation vulnerabilities */
     if (unlikely(offset + p_len > MAX_IP_PKT_SIZE)) {
-        __sync_fetch_and_add(&global_stats.reasm_oob_errors, 1);
-        slot->is_active = false;
+        __atomic_fetch_add(&global_stats.reasm_oob_errors, 1, __ATOMIC_RELAXED);
         return -1;
     }
 
-    /* 2. Overlap Detection: Use our safe bitmap function */
-    /* We check BEFORE we write to the buffer to maintain integrity */
-    if (unlikely(set_bitmap_range(slot->bitmap, offset, p_len))) {
-        /* * Industrial Policy: Log the overlap attempt and drop the fragment.
-         * This prevents 'TearDrop' style attacks where fragments overlap to
-         * bypass security filters or crash the stack.
-         */
-        LOG_WARN_RATELIMITED(5, 1, "[SECURITY] Overlapping fragment detected! ID:%u, Off:%u", 
-                             ntohs(ip->id), offset);
-        __sync_fetch_and_add(&global_stats.reasm_overlap_drops, 1);
-        /* Optional: We can choose to invalidate the entire slot to be safe */
-        slot->is_active = false; 
+    /* Retrieve or pre-emptively acquire a concurrent slot hash bucket reference */
+    reasm_slot_t *slot = xdp_get_reasm_slot(ip);
+    if (unlikely(!slot)) {
         return -1; 
     }
 
-    /* Copy fragment data and update bitmap */
-    memcpy(slot->buffer->data + offset, (uint8_t *)ip + ip_hdr_len, p_len);
-    
-    if (offset == 0) slot->header_received = true;
+    /* Track boundary fragment sequences and cache structural metadata */
+    if (offset == 0) {
+        slot->header_received = true;
+    }
     if (!mf) {
         slot->last_frag_received = true;
         slot->expected_total_len = offset + p_len;
     }
 
-    /* Check completion */
+    /* Process fragment span bitmask array mapping and detect layout overlap anomalies */
+    bool is_clone  = false;
+    bool __overlap = set_bitmap_range(slot->bitmap, offset, p_len, &is_clone);
+    
+    if (unlikely(__overlap)) {
+        __atomic_fetch_add(&global_stats.reasm_overlap_drops, 1, __ATOMIC_RELAXED);
+        LOG_WARN_RATELIMITED(5, 1, "[SECURITY] Overlapping fragment detected! ID:%u, Off:%u", 
+                             ntohs(ip->id), offset);
+        
+        /* Force-deactivate contaminated slot architecture to prevent Teardrop style state exhaustion */
+        __atomic_store_n(&slot->is_active, false, __ATOMIC_RELEASE);
+        return -1;
+    }
+
+    /* Intercept promiscuous mode skb_clone mirror twins without repeating payload copies */
+    if (unlikely(is_clone)) {
+        /* Short-circuit evaluation: Only verify bitmask completeness if boundary flags match */
+        if (slot->header_received && slot->last_frag_received) {
+            if (is_bitmap_complete(slot->bitmap, slot->expected_total_len)) {
+                goto package_complete;
+            }
+        }
+        return 0; 
+    }
+
+    /* Commit clean, non-overlapping fragment segments to sequential staging buffer memory */
+    if (likely(slot->buffer && slot->buffer->data)) {
+        memcpy(slot->buffer->data + offset, (const uint8_t *)ip + ip_hdr_len, p_len);
+    }
+
+    /* Update cache coherence tracking state timestamp */
+    __atomic_store_n(&slot->last_seen, now, __ATOMIC_RELEASE);
+
+    /* Verify if all sequence ranges have closed the allocation window successfully */
     if (slot->header_received && slot->last_frag_received) {
         if (is_bitmap_complete(slot->bitmap, slot->expected_total_len)) {
-            __sync_fetch_and_add(&global_stats.reasm_completed, 1);
+            
+package_complete:
+            __atomic_fetch_add(&global_stats.reasm_completed, 1, __ATOMIC_RELAXED);
 
-            info->payload = slot->buffer->data;
+            /* Bind the contiguous linear packet storage buffer to the exit protocol parser */
+            info->payload     = slot->buffer->data;
             info->payload_len = slot->expected_total_len;
-            slot->is_active = false; 
+            
+            /* Clear connection tuple fingerprints without releasing slot activation token.
+             * This provides a temporal structural shield against trailing duplicate bursts. */
+            slot->ip_id              = 0; 
+            slot->src_ip             = 0;
+            slot->header_received    = false;
+            slot->last_frag_received = false;
+            slot->expected_total_len = 0;
+            
+            memset((void *)slot->bitmap, 0, sizeof(uint64_t) * BITMAP_U64_COUNT);
+            
+            /* Synchronize state barrier modifications before returning slot control safely */
+            __atomic_store_n(&slot->last_seen, now, __ATOMIC_RELEASE);
 
-            /**
-             * Industrial Policy: Increment the reassembly stats counter for successful completions.
-             * This allows operators to monitor the frequency of fragment reassembly, which can be
-             * an indicator of certain types of network activity or attacks.
-             */
+            /* Update framework management plane interface statistics counter telemetry */
             cmd_reass_stats_add(
                 global_stats.reasm_completed, 
                 global_stats.reasm_timeout_counts,                      
                 global_stats.reasm_oob_errors,
                 global_stats.reasm_overlap_drops
             );
-            return 1; /* Success */
+            return 1; 
         }
     }
+
     /**
      * Industrial Policy: Increment the reassembly stats counter for successful completions.
      * This allows operators to monitor the frequency of fragment reassembly, which can be
@@ -312,7 +390,8 @@ static int xdp_do_reasm(const uint8_t *data, size_t len, pkt_info_t *info) {
         global_stats.reasm_oob_errors,
         global_stats.reasm_overlap_drops
     );
-    return 0; /* Still in progress */
+
+    return 0; 
 }
 
 int xdp_pkt_parse_all(const uint8_t *data, size_t len, pkt_info_t *info) {

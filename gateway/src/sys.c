@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <pthread.h>
 
+#include "util.h"
 #include "sys.h"
 #include "wbs.h"
 #include "redgw.h"
@@ -144,6 +145,14 @@ int sys_net_rate(const char *iface, sys_net_ctx *ctx, float *rx_kbps, float *tx_
  * @return float Memory used by this process in MegaBytes (MB). Returns -1.0f on error.
  */
 float sys_proc_mem_mb(void) {
+    const uint64_t now = get_now_ms();
+    static uint64_t last_read_time = 0;
+    static float cached_rss_mb = 0.0f;
+
+    if (now - last_read_time < 500 && cached_rss_mb > 0.0f) {
+        return cached_rss_mb;
+    }
+
     FILE *fp = fopen("/proc/self/statm", "r");
     if (!fp) return -1.0f;
 
@@ -167,7 +176,8 @@ float sys_proc_mem_mb(void) {
     }
     
     /* Convert active resident pages directly to MegaBytes (MB) */
-    float rss_mb = ((float)rss_pages * (float)page_size_bytes) / 1024.0f / 1024.0f;
+    cached_rss_mb = ((float)rss_pages * (float)page_size_bytes) / 1024.0f / 1024.0f;
+    last_read_time = now;
     
-    return rss_mb;
+    return cached_rss_mb;
 }

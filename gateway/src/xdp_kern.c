@@ -11,9 +11,6 @@
 #define TARGET_UDP_DST_PORT 52719
 
 #ifdef USE_PERF_BUFFER
-/* =================================================================
- * 🧬 5.4.18 老内核方案：Perf Buffer 拓扑
- * ================================================================= */
 struct packet_metadata {
     __u32 ifindex; 
     __u32 pkt_len;
@@ -26,9 +23,6 @@ struct {
 } pkt_perf_map SEC(".maps");
 
 #else
-/* =================================================================
- * 🚀 高版本内核方案：Ring Buffer 拓扑
- * ================================================================= */
 struct packet_event {
     __u32 ifindex;
     __u32 pkt_len;
@@ -85,7 +79,6 @@ int xdp_packet_capture(struct xdp_md *ctx) {
     __u32 pkt_len = (__u32)(data_end - data);
 
 #ifdef USE_PERF_BUFFER
-    /* 🌟 5.4 内核分支：利用特化 flags 触发硬件级 DMA 传输 */
     __u32 capture_len = pkt_len > MAX_PACKET_DATA ? MAX_PACKET_DATA : pkt_len;
     struct packet_metadata meta;
     meta.ifindex = ctx->ingress_ifindex;
@@ -95,7 +88,6 @@ int xdp_packet_capture(struct xdp_md *ctx) {
     int ret = bpf_perf_event_output(ctx, &pkt_perf_map, flags, &meta, sizeof(meta));
     if (ret < 0) return XDP_PASS;
 #else
-    /* 🚀 高版本内核分支：原汁原味 Ringbuf 预留提交 */
     struct packet_event *event = bpf_ringbuf_reserve(&pkt_ringbuf, sizeof(struct packet_event), 0);
     if (!event) return XDP_PASS;
 

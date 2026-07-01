@@ -10,6 +10,7 @@
 #include <stdatomic.h>
 #include <dirent.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "log.h"
 #include "cmd.h"
@@ -25,6 +26,8 @@ typedef struct cmd_engine_s {
     atomic_bool islogptk;      /* Atomic boolean for packet logging */
     atomic_bool isdebug;       /* Atomic boolean for debug mode */
     atomic_bool ispcap;        /* Atomic boolean for pcap start */
+
+    pthread_rwlock_t filter_lock; /* Protects filter_expr */
     char filter_expr[256];     /* Buffer for BPF filter expression */
     // gc_status_stats heart_stats; /* Reassembly statistics counters */
     struct {
@@ -40,6 +43,7 @@ static cmd_engine_t cmdengine = {
     .islogptk = ATOMIC_VAR_INIT(false), /* Default disabled */
     .isdebug = ATOMIC_VAR_INIT(true),   /* Default enabled */
     .ispcap = ATOMIC_VAR_INIT(false),   /* Default disabled */
+    .filter_lock = PTHREAD_RWLOCK_INITIALIZER,
     .filter_expr = {0}, /* Empty filter by default */
     .reass_stats = {
         .completed = ATOMIC_VAR_INIT(0),
@@ -506,9 +510,11 @@ static int cmd_pcap_filter(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
         return -1;
     }
 
+    pthread_rwlock_rdlock(&cmdengine.filter_lock);
     /* Update the filter expression atomically */
     strncpy(engine->filter_expr, filter_expr, sizeof(engine->filter_expr) - 1);
     engine->filter_expr[sizeof(engine->filter_expr) - 1] = '\0';
+    pthread_rwlock_unlock(&cmdengine.filter_lock);
 
     if (pcap_mod_set(engine->filter_expr) < 0) {
         cmd_resp_red(resp, 
@@ -590,9 +596,11 @@ static int cmd_pcap_capture(void *ctx, int argc, char **argv, cmd_resp_t *resp) 
                 return -1;
             }
 
+            pthread_rwlock_rdlock(&cmdengine.filter_lock);
             /* Update the filter expression atomically */
             strncpy(engine->filter_expr, filter_expr, sizeof(engine->filter_expr) - 1);
             engine->filter_expr[sizeof(engine->filter_expr) - 1] = '\0';
+            pthread_rwlock_unlock(&cmdengine.filter_lock);
 
             if (pcap_mod_set(engine->filter_expr) < 0) {
                 cmd_resp_red(resp, 
@@ -617,7 +625,11 @@ static int cmd_pcap_capture(void *ctx, int argc, char **argv, cmd_resp_t *resp) 
         pcap_mod_free();
         g_cap_inited.pcap_inited = false;
         g_cap_inited.iseth1 = false;
+
+        pthread_rwlock_rdlock(&cmdengine.filter_lock);
         memset(engine->filter_expr, 0, sizeof(engine->filter_expr));
+        pthread_rwlock_unlock(&cmdengine.filter_lock);
+
         is_normal_stop = true;
     }
 
@@ -971,6 +983,81 @@ void cmd_setdebug_enabled(bool enabled) {
 
 bool cmd_ispcap_enabled(void) {
     return atomic_load(&cmdengine.ispcap);
+}
+
+bool cmd_iseth1_enabled(void) {
+    return g_cap_inited.pcap_inited ? g_cap_inited.iseth1 ? true : false : true;
+}
+
+int cmd_get_pcap_filter_safe(char *buf, size_t max_len) {
+    if (!buf || max_len == 0) return -1;
+
+    pthread_rwlock_rdlock(&cmdengine.filter_lock);
+
+    strncpy(buf, cmdengine.filter_expr, max_len - 1);
+    buf[max_len - 1] = '\0';
+    int len = (int)strlen(buf);
+
+    pthread_rwlock_unlock(&cmdengine.filter_lock);
+
+    return len;
+}
+
+static inline void cmd_pcap_clean() {
+    pcap_mod_free();
+    g_cap_inited.pcap_inited = false;
+    g_cap_inited.iseth1 = false;
+
+    pthread_rwlock_rdlock(&cmdengine.filter_lock);
+    memset(cmdengine.filter_expr, 0, sizeof(cmdengine.filter_expr));
+    pthread_rwlock_unlock(&cmdengine.filter_lock);
+}
+
+void cmd_setpcap_enabled(bool enabled, const char *ifname, const char *filter) {
+    if (!ifname) return;
+
+    atomic_store(&cmdengine.ispcap, enabled);
+
+    if (!enabled && g_cap_inited.pcap_inited) {
+        cmd_pcap_clean();
+        return;
+    }
+
+    if (g_cap_inited.pcap_inited) {
+        if (g_cap_inited.iseth1) {
+            if (strcasecmp(ifname, "eth1") != 0) {
+                log_warn("PCAP is already initialized on eth1. Please stop it before starting on eth2.");
+                cmd_pcap_clean();
+            }
+        } else {
+            if (strcasecmp(ifname, "eth2") != 0) {
+                log_warn("PCAP is already initialized on eth2. Please stop it before starting on eth1.");
+                cmd_pcap_clean();
+            }
+        }
+    }
+
+    if (enabled) {
+        if (!g_cap_inited.pcap_inited)
+            cmd_pcap_init(ifname);
+
+        if (strlen(filter) >= sizeof(cmdengine.filter_expr)) {
+            log_error("ERR: Filter expression is too long. Maximum length is %lu characters.", sizeof(cmdengine.filter_expr) - 1);
+            return;
+        }
+
+        pthread_rwlock_rdlock(&cmdengine.filter_lock);
+        /* Update the filter expression atomically */
+        strncpy(cmdengine.filter_expr, filter, sizeof(cmdengine.filter_expr) - 1);
+        cmdengine.filter_expr[sizeof(cmdengine.filter_expr) - 1] = '\0';
+        pthread_rwlock_unlock(&cmdengine.filter_lock);
+
+        if (pcap_mod_set(cmdengine.filter_expr) < 0) {
+            log_error("ERR: Failed to update PCAP filter(%s). Please check the filter syntax.", filter);
+            return;
+        }
+        log_info("Filter expression (%s)", filter);
+    }
 }
 
 /**
