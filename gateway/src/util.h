@@ -21,6 +21,10 @@
 #define unlikely(x)    __builtin_expect(!!(x), 0)
 #endif
 
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+#endif
+
 /**
  * @brief Retrieves the raw binary MAC address and IPv4 address of the first active interface.
  * * This function iterates through available network interfaces to find the first 
@@ -82,5 +86,17 @@ int ip_ntop(uint32_t ip_bin, char *out_str, size_t size);
 uint16_t ip_calculate_checksum(const void* data, size_t len);
 
 const char *ip_to_str(uint32_t ip);
+
+/**
+ * @brief Retrieves the active IPv4 address tied to a specific network interface.
+ * @param ifname   The network interface identifier string (e.g., "eth0", "ens33").
+ * @param ip_buf   Destination pointer to memory buffer where the IP string will be written.
+ * @param buf_len  Size of the destination buffer. Strictly recommended to be >= INET_ADDRSTRLEN (16).
+ * @return int     1 on success (IP found and copied safely);
+ *                 0 on failure (Interface down, missing IPv4 binding, or invalid parameters).
+ * @note Production-grade implementation using getifaddrs() to bypass obsolete ioctl limits.
+ *       It guarantees zero buffer overflows and properly ignores non-IPv4 interface links.
+ */
+int get_interface_ip(const char *ifname, char *ip_buf, size_t buf_len);
 
 #endif

@@ -31,6 +31,11 @@
 #define FRAG_UNIT               8                                   /* IP fragments are in 8-byte blocks */
 #define BITMAP_U64_COUNT        (MAX_IP_PKT_SIZE / FRAG_UNIT / 64)
 
+typedef struct {
+    uint16_t sport;
+    uint16_t dport;
+} udp_ports_t;
+
 /* Parse Result Codes */
 enum parse_result {
     PARSE_OK             =  0,
@@ -574,12 +579,14 @@ static ssize_t xdp_pkt_to_buf(const pkt_info_t *pkt, uint8_t *buf, size_t max_le
  *
  * @param  payload      Pointer to the start of the tunnel payload (Auth Header).
  * @param  payload_len  Total size of the payload provided by the ring buffer.
- * @return uint16_t     Inner UDP destination port in Host Byte Order, or 0 if invalid.
+ * @return udp_ports_t     Inner UDP destination port in Host Byte Order, or 0 if invalid.
  */
-static inline uint16_t xdp_get_inner_dport(const uint8_t *payload, size_t payload_len) {
+static inline udp_ports_t xdp_get_inner_dport(const uint8_t *payload, size_t payload_len) {
+    udp_ports_t ports = {0, 0};
+
     /* 1. Initial boundary check: Must accommodate Auth(16) + Eth(14) + Min IPv4(20) */
     if (unlikely(payload_len < (HDR_SIZE + 14 + sizeof(struct iphdr)))) {
-        return 0;
+        return ports;
     }
 
     /* Jump to the start of the inner IP header */
@@ -589,12 +596,12 @@ static inline uint16_t xdp_get_inner_dport(const uint8_t *payload, size_t payloa
     // ip_ptr[0]: High 4 bits = Version, Low 4 bits = IHL (Internet Header Length)
     uint8_t ver_ihl = ip_ptr[0];
     if (unlikely((ver_ihl >> 4) != 4)) {
-        return 0; // Not an IPv4 packet
+        return ports; // Not an IPv4 packet
     }
     
     // Check Protocol field (offset 9 in IPv4 header)
     if (unlikely(ip_ptr[9] != IPPROTO_UDP)) {
-        return 0; // Not a UDP packet
+        return ports; // Not a UDP packet
     }
 
     /* 3. Calculate dynamic IP Header Length (IHL) 
@@ -606,18 +613,22 @@ static inline uint16_t xdp_get_inner_dport(const uint8_t *payload, size_t payloa
     // Offset = Auth + Ethernet + Variable IP Header Length
     size_t udp_offset = HDR_SIZE + 14 + ip_hl;
     if (unlikely(payload_len < (udp_offset + sizeof(struct udphdr)))) {
-        return 0; // Malformed packet or truncated UDP header
+        return ports; // Malformed packet or truncated UDP header
     }
 
     /* 5. Extract Destination Port
      * UDP header structure: Source Port (2B), Destination Port (2B).
      * We use memcpy to prevent Unaligned Access exceptions on strict architectures.
      */
-    uint16_t dport;
-    memcpy(&dport, payload + udp_offset + 2, sizeof(uint16_t));
+    uint16_t raw_sport, raw_dport;
+    memcpy(&raw_sport, payload + udp_offset, sizeof(uint16_t));
+    memcpy(&raw_dport, payload + udp_offset + 2, sizeof(uint16_t));
     
     /* Convert from Network Byte Order (Big-Endian) to Host Byte Order */
-    return ntohs(dport);
+    ports.sport = ntohs(raw_sport);
+    ports.dport = ntohs(raw_dport);
+
+    return ports;
 }
 
 
@@ -633,10 +644,10 @@ static inline void xdp_decapsulated_packet(struct redgwserver *server_ctx, pkt_i
             
             switch (inner_eth_type) {
                 case PKT_TYPE_ENG: {
-                    uint16_t inner_dport = xdp_get_inner_dport(inner_base, info->payload_len);
-                    if (likely(pkt_is_engine_port(inner_dport))) {
-                        log_info("BLACK --> RED : (%s) | ethtype: 0x%04X | inner_dport: %u | Length: %zu", 
-                                 server_ctx->dev1, inner_eth_type, inner_dport, packet_len);
+                    udp_ports_t ports = xdp_get_inner_dport(inner_base, info->payload_len);
+                    if (likely(pkt_is_engine_port(ports.dport))) {
+                        log_info("BLACK --> RED : (%s) | ethtype: 0x%04X | ports: %u -> %u | Length: %zu", 
+                                 server_ctx->dev1, inner_eth_type, ports.sport, ports.dport, packet_len);
                         gw_send_to_client(packet_data, packet_len);
                     }
                     break;
@@ -658,8 +669,8 @@ static inline void xdp_decapsulated_packet(struct redgwserver *server_ctx, pkt_i
             case PKT_CTRL_SRC_PORT:
             case PKT_ADD_PORT:
                 if (likely(info->payload_len > 0)) {
-                    log_info("RED --> BLACK : (%s) | ethtype: 0x%04X | src_port: %u | Length: %zu", 
-                        server_ctx->dev2, info->eth.proto, info->l4.src_port, packet_len);
+                    log_info("RED --> BLACK : (%s) | ethtype: 0x%04X | ports: %u -> %u | Length: %zu", 
+                        server_ctx->dev2, info->eth.proto, info->l4.src_port, info->l4.dst_port, packet_len);
                     gw_send_to_core(packet_data, packet_len);
                 }
                 break;

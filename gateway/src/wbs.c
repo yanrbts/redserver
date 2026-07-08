@@ -1,18 +1,20 @@
-/**
- * @file wbs_gw.c
- * @brief Thread-safe production-grade gateway wrapper matching original wsServer APIs
- * @note Integrated with automated background heartbeats (ping/pong tracking) and slot recycling.
+/*
+ * Copyright (c) 2026-2026, Red LRM.
+ * Author: [yanruibing]
+ * All rights reserved.
  */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <math.h>
+#include <ctype.h>
+#include <arpa/inet.h>
 
 #include "ws.h" 
 #include "wbs.h"
+#include "util.h"
 #include "log.h"
 #include "cJSON.h"
 #include "cmdengine.h"
@@ -41,6 +43,332 @@ typedef struct {
 
 static wbs_ctx_t g_ctx = {0};
 
+static const char *const SYSTEM_WHITELIST_TOKENS[] = {
+    /* --- Network Diagnostics & Configuration --- */
+    "ping",         /* ICMP connectivity check */
+    "ip",           /* Modern link, address, and routing management */
+    "ifconfig",     /* Legacy interface telemetry */
+    "route",        /* IP routing table manager */
+    "sysctl",       /* Kernel parameter tuner (e.g., net.ipv4.ip_forward) */
+    "netstat",      /* Network statistics and socket auditing */
+    "ss",           /* High-performance socket statistics (modern netstat) */
+    "traceroute",   /* Route path packet tracing */
+    "mtr",          /* Combined ping + traceroute real-time diagnostic */
+    "tcpdump",      /* Low-level network packet capturing and filtering */
+    "nslookup",     /* DNS lookup agent */
+    "dig",          /* Advanced DNS lookup tool */
+    "arp",          /* ARP table manipulator */
+
+    /* --- Process Management & System Performance --- */
+    "ls",           /* Directory listing utility */
+    "systemctl",    /* Systemd service and unit controller */
+    "df",           /* Disk filesystem space telemetry */
+    "free",         /* Memory sub-system metrics */
+    "uname",        /* Print kernel and OS metadata */
+    "tail",         /* Real-time stream log tracking */
+    "ps",           /* Static snapshot of current active processes */
+    "kill",         /* Process termination agent */
+    "lsof",         /* List open files and network ports mapped to processes */
+    "pidof",        /* Find the PID of a running program by name */
+    "uptime"        /* System load average and historical operational uptime */
+};
+
+/**
+ * @brief Parse the interior payload object and commit configurations safely to the data-plane.
+ * @param payload Pointer to the valid cJSON object node containing config parameters.
+ */
+static void ws_process_config_payload(const cJSON *payload) {
+    if (!payload || !cJSON_IsObject(payload)) return;
+
+    cJSON *isdebug_node   = cJSON_GetObjectItemCaseSensitive(payload, "isdebug");
+    cJSON *islogpkt_node  = cJSON_GetObjectItemCaseSensitive(payload, "islogpkt");
+    cJSON *iscapture_node = cJSON_GetObjectItemCaseSensitive(payload, "iscapture");
+    cJSON *ifname_node    = cJSON_GetObjectItemCaseSensitive(payload, "capture_interface");
+    cJSON *filter_node    = cJSON_GetObjectItemCaseSensitive(payload, "packet_filter");
+
+    int local_debug   = cJSON_IsBool(isdebug_node)   ? cJSON_IsTrue(isdebug_node) : 0;
+    int local_logpkt  = cJSON_IsBool(islogpkt_node)  ? cJSON_IsTrue(islogpkt_node) : 0;
+    int local_capture = cJSON_IsBool(iscapture_node) ? cJSON_IsTrue(iscapture_node) : 0;
+
+    char safe_ifname[32] = {0};
+    char safe_filter[256] = {0};
+
+    if (cJSON_IsString(ifname_node) && ifname_node->valuestring != NULL) {
+        strncpy(safe_ifname, ifname_node->valuestring, sizeof(safe_ifname) - 1);
+    } else {
+        strncpy(safe_ifname, "eth1", sizeof(safe_ifname) - 1); /* Safe fallback telemetry boundary */
+    }
+
+    if (cJSON_IsString(filter_node) && filter_node->valuestring != NULL) {
+        strncpy(safe_filter, filter_node->valuestring, sizeof(safe_filter) - 1);
+    } else {
+        safe_filter[0] = '\0';
+    }
+
+    log_info("[KERNEL CONFIG] Received Frontend Control Flow Optimizations");
+    log_info("[Debug Tracking]  -> %s", local_debug   ? "ENABLED" : "DISABLED");
+    log_info("[XDP Reassembly]  -> %s", local_logpkt  ? "ENABLED" : "DISABLED");
+    log_info("[PCAP Capture  ]  -> %s", local_capture ? "ENABLED" : "DISABLED");
+    log_info("[Interface     ]  -> %s", safe_ifname);
+    log_info("[BPF Filter    ]  -> \"%s\"", safe_filter);
+
+    cmd_setdebug_enabled(local_debug ? true : false);
+    cmd_setlogpkt_enabled(local_logpkt ? true : false);
+    cmd_setpcap_enabled(local_capture ? true : false, safe_ifname, safe_filter);
+}
+
+/**
+ * @brief Helper function to wrap command execution results into a compliant JSON frame and send to client.
+ * @param ctx The opaque connection context pointer (e.g., rbuf connection instance).
+ * @param cmd_out The raw stdout/stderr output from the executed command.
+ * @param cmd_len The byte length of the command output.
+ */
+static void ws_send_cmd_response(const char *cmd_out, size_t cmd_len) {
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        log_error("%s Failed to allocate memory for response JSON object.", TAG);
+        return;
+    }
+
+    cJSON_AddStringToObject(root, "type", "cmd");
+    if (cmd_out && cmd_len > 0) {
+        cJSON_AddStringToObject(root, "payload", cmd_out);
+    } else {
+        cJSON_AddStringToObject(root, "payload", "[SYS] Command executed with blank output stream.");
+    }
+
+    char *json_frame = cJSON_PrintUnformatted(root);
+    if (json_frame) {
+        size_t frame_len = strlen(json_frame);
+        wbs_bcast(json_frame, frame_len);
+        free(json_frame);
+    } else {
+        log_error("%s Failed to serialize command response JSON frame.", TAG);
+    }
+
+    cJSON_Delete(root);
+}
+
+/**
+ * @brief Enterprise Security Sentinel: Command Validation Engine with Sudo Stripping
+ * Uses zero-copy pointer iteration to completely eliminate buffer overflow risks.
+ * @param raw_cmd The raw command string received from the websocket payload.
+ * @return 1 if the command passes the compliance matrix, 0 if intercepted.
+ */
+static int ws_is_command_allowed(const char *raw_cmd) {
+    if (!raw_cmd) return 0;
+
+    /* Phase 1: Pre-whitespace sanitization (Skip leading spaces/tabs) */
+    const char *p_start = raw_cmd;
+    while (*p_start && isspace((unsigned char)*p_start)) {
+        p_start++;
+    }
+
+    if (*p_start == '\0') return 0;
+
+    /* Phase 2: Shell Injection Mitigation
+     * Scan the entire string for structural characters used to chain malicious commands,
+     * execute background jobs, or exploit environmental variables. */
+    if (strpbrk(p_start, "|;&`$\n\r")) {
+        log_warn("%s Critical Interception: Malicious shell syntax chaining sequence blocked!", TAG);
+        return 0;
+    }
+
+    /* Phase 3: Token Tracking (Locate the right boundary of the first word) */
+    const char *p_end = p_start;
+    while (*p_end && !isspace((unsigned char)*p_end)) {
+        p_end++;
+    }
+    
+    size_t first_token_len = (size_t)(p_end - p_start);
+    if (first_token_len == 0) return 0;
+
+    /* Phase 4: Adaptive Privilege State Machine
+     * Check if the command prefixes with "sudo". Exact string match enforces strict boundary rules,
+     * preventing bypass tricks like "sudoee". */
+    if (first_token_len == 4 && strncmp(p_start, "sudo", 4) == 0) {
+        
+        /* Shift pointers past "sudo" and clear intermediate spaces to find the real executable */
+        p_start = p_end;
+        while (*p_start && isspace((unsigned char)*p_start)) {
+            p_start++;
+        }
+        
+        /* Edge case safety check: string containing only "sudo " is rejected */
+        if (*p_start == '\0') {
+            return 0;
+        }
+        
+        /* Relocate the right boundary for the actual target binary executable token */
+        p_end = p_start;
+        while (*p_end && !isspace((unsigned char)*p_end)) {
+            p_end++;
+        }
+    }
+
+    /* Phase 5: Calculate targeted functional binary string length */
+    size_t target_token_len = (size_t)(p_end - p_start);
+    if (target_token_len == 0) return 0;
+
+    /* Phase 6: Zero-Copy Compliant Matching Against Whitelist Matrix */
+    size_t whitelist_size = ARRAY_SIZE(SYSTEM_WHITELIST_TOKENS);
+    for (size_t i = 0; i < whitelist_size; i++) {
+        const char *allowed_token = SYSTEM_WHITELIST_TOKENS[i];
+        
+        /* Both length and exact string payload must correspond completely */
+        if (strlen(allowed_token) == target_token_len && 
+            strncmp(p_start, allowed_token, target_token_len) == 0) {
+            return 1; /* Verified: Secure system telemetry command authorized */
+        }
+    }
+
+    log_warn("%s Access Denied: Executable target \"%.*s\" failed compliance whitelist matching.", 
+             TAG, (int)target_token_len, p_start);
+    return 0;
+}
+
+void wbs_on_cmd_stream_flash(void *ctx, const char *data, size_t len) {
+    (void)ctx; /* Unused parameter in this context */
+    if (!data || len == 0) return;
+
+    if (len >= SYS_CHUNK_SIZE) {
+        len = SYS_CHUNK_SIZE - 1;
+    }
+
+    char buf[SYS_CHUNK_SIZE];
+    memcpy(buf, data, len);
+    buf[len] = '\0';
+
+    ws_send_cmd_response(buf, len);
+}
+
+/**
+ * @brief Parse the flat command payload string, automatically discriminate execution profiles,
+ * and dispatch to either synchronous aggregation or real-time pipeline streaming.
+ * @param payload Pointer to the valid cJSON string node containing the command text.
+ * @param ctx The opaque connection context tracking identifier (e.g., connection session / descriptor).
+ */
+static void ws_process_cmd_payload(const cJSON *payload, void *ctx) {
+    if (!payload || !cJSON_IsString(payload)) return;
+
+    const char *raw_cmd = payload->valuestring;
+    if (strlen(raw_cmd) == 0) {
+        const char *error_msg = "Error: Command payload string cannot be empty.";
+        log_warn("%s %s", TAG, error_msg);
+        ws_send_cmd_response(error_msg, strlen(error_msg));
+        return;
+    }
+
+    if (!ws_is_command_allowed(raw_cmd)) {
+        char deny_msg[512];
+        int offset = snprintf(deny_msg, sizeof(deny_msg), 
+            " Security Notice: Action rejected. Target executable not listed in hardware matrix.\n"
+            " Available Commands: [ ");
+
+        size_t whitelist_size = ARRAY_SIZE(SYSTEM_WHITELIST_TOKENS);
+        for (size_t i = 0; i < whitelist_size; i++) {
+            if (offset < (int)sizeof(deny_msg) - 32) {
+                offset += snprintf(deny_msg + offset, sizeof(deny_msg) - offset, 
+                                   "%s%s", SYSTEM_WHITELIST_TOKENS[i], (i == whitelist_size - 1) ? "" : ", ");
+            }
+        }
+        
+        snprintf(deny_msg + offset, sizeof(deny_msg) - offset, " ]");
+        ws_send_cmd_response(deny_msg, strlen(deny_msg));
+        return;
+    }
+
+    log_info("%s Inspecting routing policy for system directive: \"%s\"", TAG, raw_cmd);
+
+    sys_run_cmd(raw_cmd, ctx, wbs_on_cmd_stream_flash);
+
+    return;
+}
+
+/**
+ * @brief Derives the legacy standard CIDR prefix length based on IPv4 classful routing rules.
+ * @param ip Crucial raw IP string token to perform class deduction.
+ * @return Integer representational value of the computed netmask bits (8, 16, or 24).
+ */
+static int get_classful_prefix_len(const char *ip) {
+    if (!ip || *ip == '\0') {
+        return 24; /* Fallback default standard for Class C / local networks */
+    }
+    
+    int first_octet = atoi(ip);
+    if (first_octet >= 1 && first_octet <= 126) {
+        return 8;   /* Class A Network Allocation Block (e.g., 10.0.0.0/8) */
+    } else if (first_octet >= 128 && first_octet <= 191) {
+        return 16;  /* Class B Network Allocation Block (e.g., 172.16.0.0/16) */
+    }
+    return 24;      /* Class C Network Allocation Block (e.g., 192.168.0.0/24) */
+}
+
+/**
+ * @brief Industrial-grade parsing entry point for executing stateless WebSocket network interfaces mutations.
+ * @param payload Active pointer tracking the unmarshalled root cJSON node context payload.
+ */
+static void ws_process_wlan_payload(cJSON *payload) {
+    if (unlikely(!payload)) {
+        return;
+    }
+
+    cJSON *iface_node = cJSON_GetObjectItemCaseSensitive(payload, "target_interface");
+    cJSON *ip_node    = cJSON_GetObjectItemCaseSensitive(payload, "target_ip");
+
+    if (!cJSON_IsString(iface_node) || !iface_node->valuestring ||
+        !cJSON_IsString(ip_node)    || !ip_node->valuestring) {
+        log_error("[WS] SET_IP missing required target_interface or target_ip payload parameters.");
+        return;
+    }
+
+    const char *interface_name = iface_node->valuestring;
+    const char *target_ip      = ip_node->valuestring;
+
+    /* 
+     * [SECURITY MITIGATION]: High-severity shell command injection containment.
+     * Intercepts metacharacters to completely isolate hazardous terminal executions. 
+     */
+    if (strpbrk(interface_name, ";&|`$\n\r") || strpbrk(target_ip, ";&|`$\n\r")) {
+        log_error("[WS] Critical Security Violation: Shell injection token sequence intercepted. Operations dropped.");
+        return;
+    }
+
+    /* Isolated tracking memory block matrices for clean parameter translation */
+    char clean_ip[48] = {0};
+    int final_prefix_len = 24; /* Initialize with default standard */
+    
+    /* Evaluate string topology to see if target input presents a standard CIDR slash format */
+    const char *slash = strchr(target_ip, '/');
+    
+    if (slash) {
+        /* Verify string memory bounds explicitly before execution to eliminate buffer overflow vectors */
+        size_t ip_bytes = (size_t)(slash - target_ip);
+        if (ip_bytes >= sizeof(clean_ip)) {
+            log_error("[WS] Structural anomaly detected: IP length exceeds platform stack safety parameters.");
+            return;
+        }
+        
+        /* Isolate the raw structural IP prefix without the tailing slash network bit representation */
+        memcpy(clean_ip, target_ip, ip_bytes);
+        clean_ip[ip_bytes] = '\0';
+        
+        /* Capture and validate prefix notation bounds securely */
+        int input_prefix = atoi(slash + 1);
+        if (input_prefix >= 0 && input_prefix <= 32) {
+            final_prefix_len = input_prefix;
+        } else {
+            /* Fallback to classful rules if the provided slash number is corrupted (e.g., /99) */
+            final_prefix_len = get_classful_prefix_len(clean_ip);
+        }
+    } else {
+        final_prefix_len = get_classful_prefix_len(target_ip);
+    }
+
+    int ret = set_interface_primary_ip(interface_name, target_ip, final_prefix_len);
+    log_info("[WS] SET_IP executed for %s with IP %s/%d, %s", interface_name, target_ip, final_prefix_len, ret ? "SUCCESS" : "FAILURE");
+}
+
 /**
  * @brief  Internal static helper to safely parse dashboard JSON control packet and dump metrics.
  * @param  json_str [in] Null-terminated or length-bounded JSON string sequence.
@@ -65,54 +393,23 @@ static void ws_parse_config(const char *json_str, uint64_t len) {
 
     /* 3. Extract the multiplexing discriminator identifier "type" */
     cJSON *type_node = cJSON_GetObjectItemCaseSensitive(root, "type");
-    if (cJSON_IsString(type_node) && type_node->valuestring && strcmp(type_node->valuestring, "config") == 0) {
-        
+    if (cJSON_IsString(type_node) && type_node->valuestring && strcmp(type_node->valuestring, "config") == 0) {    
         cJSON *payload = cJSON_GetObjectItemCaseSensitive(root, "payload");
         if (payload && cJSON_IsObject(payload)) {
-            
-            /* 4. Extract telemetry nodes from payload */
-            cJSON *isdebug_node   = cJSON_GetObjectItemCaseSensitive(payload, "isdebug");
-            cJSON *islogpkt_node  = cJSON_GetObjectItemCaseSensitive(payload, "islogpkt");
-            cJSON *iscapture_node = cJSON_GetObjectItemCaseSensitive(payload, "iscapture");
-            cJSON *ifname_node    = cJSON_GetObjectItemCaseSensitive(payload, "capture_interface");
-            cJSON *filter_node    = cJSON_GetObjectItemCaseSensitive(payload, "packet_filter");
-
-            /* 5. Direct translation to primitives with explicit type verification */
-            int local_debug   = cJSON_IsBool(isdebug_node)   ? cJSON_IsTrue(isdebug_node) : 0;
-            int local_logpkt  = cJSON_IsBool(islogpkt_node)  ? cJSON_IsTrue(islogpkt_node) : 0;
-            int local_capture = cJSON_IsBool(iscapture_node) ? cJSON_IsTrue(iscapture_node) : 0;
-
-            char safe_ifname[32] = {0};
-            char safe_filter[256] = {0};
-
-            if (cJSON_IsString(ifname_node) && ifname_node->valuestring != NULL) {
-                strncpy(safe_ifname, ifname_node->valuestring, sizeof(safe_ifname) - 1);
-            } else {
-                strncpy(safe_ifname, "eth1", sizeof(safe_ifname) - 1); // 兜底默认网卡
-            }
-
-            if (cJSON_IsString(filter_node) && filter_node->valuestring != NULL) {
-                strncpy(safe_filter, filter_node->valuestring, sizeof(safe_filter) - 1);
-            } else {
-                safe_filter[0] = '\0';
-            }
-
-            /* 6. Direct Industrial high-visibility telemetry dump on console */
-            log_info("[KERNEL CONFIG] Received Frontend Control Flow Optimizations");
-            log_info("[Debug Tracking]  -> %s", local_debug   ? "ENABLED" : "DISABLED");
-            log_info("[XDP Reassembly]  -> %s", local_logpkt  ? "ENABLED" : "DISABLED");
-            log_info("[PCAP Capture ]  -> %s", local_capture  ? "ENABLED" : "DISABLED");
-            log_info("[Interface    ]  -> %s", safe_ifname);
-            log_info("[BPF Filter   ]  -> \"%s\"", safe_filter);
-
-            /* 7. Atomically apply or commit states to data-plane engines */
-            cmd_setdebug_enabled(local_debug ? true : false);
-            cmd_setlogpkt_enabled(local_logpkt ? true : false);
-            cmd_setpcap_enabled(local_capture ? true : false, safe_ifname, safe_filter);
+            ws_process_config_payload(payload);
+        }
+    } else if (cJSON_IsString(type_node) && type_node->valuestring && strcmp(type_node->valuestring, "cmd") == 0) {
+        cJSON *payload = cJSON_GetObjectItemCaseSensitive(root, "payload");
+        if (payload && cJSON_IsString(payload)) {
+            ws_process_cmd_payload(payload, NULL);
+        }
+    } else if (cJSON_IsString(type_node) && type_node->valuestring && strcmp(type_node->valuestring, "wlan") == 0) {
+        cJSON *payload = cJSON_GetObjectItemCaseSensitive(root, "payload");
+        if (payload && cJSON_IsObject(payload)) {
+            ws_process_wlan_payload(payload);
         }
     }
 
-    /* 8. Enforce strict heap reclamation to avoid critical memory leakage */
     cJSON_Delete(root);
 }
 
@@ -424,6 +721,16 @@ static void ws_report_system_status(sys_net_ctx *eth1_ctx, sys_net_ctx *eth2_ctx
     if (!payload) goto cleanup_fail;
     cJSON_AddItemToObject(root, "payload", payload);
 
+    int isxdp1 = sys_is_xdp_loaded(redserver.dev1);
+    int isxdp2 = sys_is_xdp_loaded(redserver.dev2);
+    char eth1_buffer[INET_ADDRSTRLEN];
+    char eth2_buffer[INET_ADDRSTRLEN];
+    char ddev_buffer[INET_ADDRSTRLEN];
+
+    get_interface_ip(redserver.dev1, eth1_buffer, sizeof(eth1_buffer));
+    get_interface_ip(redserver.dev2, eth2_buffer, sizeof(eth2_buffer));
+    get_interface_ip(redserver.ddev, ddev_buffer, sizeof(ddev_buffer));
+
     if (!cJSON_AddStringToObject(payload, "version", "2.0.1")) goto cleanup_fail;
     if (!cJSON_AddStringToObject(payload, "gateway_ip", redserver.gw_host)) goto cleanup_fail;
     if (!cJSON_AddNumberToObject(payload, "gateway_port", redserver.ws_port)) goto cleanup_fail;
@@ -434,8 +741,14 @@ static void ws_report_system_status(sys_net_ctx *eth1_ctx, sys_net_ctx *eth2_ctx
     if (!cJSON_AddNumberToObject(payload, "black_port", redserver.core_port)) goto cleanup_fail;
     if (!cJSON_AddStringToObject(payload, "eth1_name", redserver.dev1 ? redserver.dev1 : "eth1")) goto cleanup_fail;
     if (!cJSON_AddNumberToObject(payload, "eth1_speed", eth1_rx)) goto cleanup_fail;
+    if (!cJSON_AddStringToObject(payload, "eth1_ip", eth1_buffer)) goto cleanup_fail;
+    if (!cJSON_AddBoolToObject(payload, "eth1_xdp", isxdp1)) goto cleanup_fail;
     if (!cJSON_AddStringToObject(payload, "eth2_name", redserver.dev2 ? redserver.dev2 : "eth2")) goto cleanup_fail;
     if (!cJSON_AddNumberToObject(payload, "eth2_speed", eth2_rx)) goto cleanup_fail;
+    if (!cJSON_AddStringToObject(payload, "eth2_ip", eth2_buffer)) goto cleanup_fail;
+    if (!cJSON_AddBoolToObject(payload, "eth2_xdp", isxdp2)) goto cleanup_fail;
+    if (!cJSON_AddStringToObject(payload, "ddev_name", redserver.ddev ? redserver.ddev : "ddev")) goto cleanup_fail;
+    if (!cJSON_AddStringToObject(payload, "ddev_ip", ddev_buffer)) goto cleanup_fail;
 
     char *json_raw_str = cJSON_PrintUnformatted(root);
     if (!json_raw_str) goto cleanup_fail;
@@ -484,15 +797,17 @@ static void ws_report_live_config(void) {
     bool is_logpkt = cmd_islogpkt_enabled();
     bool is_debug  = cmd_isdebug_enabled();
     bool is_capture = cmd_ispcap_enabled();
-    bool is_eth1 = cmd_iseth1_enabled();
+    const char *ceth = cmd_get_current_eth();
     char filter[256] = {0};
     cmd_get_pcap_filter_safe(filter, sizeof(filter));
 
-    cJSON_AddBoolToObject(payload, "isdebug", is_debug);      /* Map debug tracking state */
-    cJSON_AddBoolToObject(payload, "islogpkt", is_logpkt);    /* Map packet reassembly state */
-    cJSON_AddBoolToObject(payload, "iscapture", is_capture);   /* Placeholder/Default placeholder */
-    cJSON_AddStringToObject(payload, "capture_interface", is_eth1 ? "eth1" : "eth2");     /* Sync standard system log toggle */
-    cJSON_AddStringToObject(payload, "packet_filter", filter);     /* Sync standard system log toggle */
+    cJSON_AddBoolToObject(payload, "isdebug", is_debug);            /* Map debug tracking state */
+    cJSON_AddBoolToObject(payload, "islogpkt", is_logpkt);          /* Map packet reassembly state */
+    cJSON_AddBoolToObject(payload, "iscapture", is_capture);        /* Placeholder/Default placeholder */
+    cJSON_AddStringToObject(payload, "capture_interface", ceth);    /* Sync standard system log toggle */
+    cJSON_AddStringToObject(payload, "packet_filter", filter);      /* Sync standard system log toggle */
+    cJSON_AddStringToObject(payload, "dev1", redserver.dev1);      /* Sync standard system log toggle */
+    cJSON_AddStringToObject(payload, "dev2", redserver.dev2);      /* Sync standard system log toggle */
 
     /* 5. Serialize cJSON structure into unformatted, compact raw string sequence */
     char *json_raw_str = cJSON_PrintUnformatted(root);

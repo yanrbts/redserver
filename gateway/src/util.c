@@ -222,3 +222,58 @@ const char *ip_to_str(uint32_t ip) {
     snprintf(res, 16, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
     return res;
 }
+
+/**
+ * @brief Retrieves the active IPv4 address tied to a specific network interface.
+ * 
+ * @param ifname   The network interface identifier string (e.g., "eth0", "ens33").
+ * @param ip_buf   Destination pointer to memory buffer where the IP string will be written.
+ * @param buf_len  Size of the destination buffer. Strictly recommended to be >= INET_ADDRSTRLEN (16).
+ * 
+ * @return int     1 on success (IP found and copied safely);
+ *                 0 on failure (Interface down, missing IPv4 binding, or invalid parameters).
+ * 
+ * @note Production-grade implementation using getifaddrs() to bypass obsolete ioctl limits.
+ *       It guarantees zero buffer overflows and properly ignores non-IPv4 interface links.
+ */
+int get_interface_ip(const char *ifname, char *ip_buf, size_t buf_len) {
+    if (!ifname || ifname[0] == '\0' || !ip_buf || buf_len < INET_ADDRSTRLEN) {
+        return 0;
+    }
+
+    struct ifaddrs *ifaddr_list = NULL;
+    struct ifaddrs *ifa = NULL;
+    int success = 0;
+
+    /* Populate the system interface linked list */
+    if (getifaddrs(&ifaddr_list) == -1) {
+        return 0;
+    }
+
+    /* Traversal sequence across active kernel interface nodes */
+    for (ifa = ifaddr_list; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL) {
+            continue;
+        }
+
+        /* Enforce strict matching against target name and filter for IPv4 family only */
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            if (strcmp(ifa->ifa_name, ifname) == 0) {
+                /* Validate interface flag metrics to ensure it is up and operational */
+                if (ifa->ifa_flags & IFF_UP) {
+                    struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+                    
+                    /* Thread-safe network-to-string translation with boundary checks */
+                    if (inet_ntop(AF_INET, &(sa->sin_addr), ip_buf, buf_len) != NULL) {
+                        success = 1;
+                        break; /* Targeted match successfully locked, exit loop */
+                    }
+                }
+            }
+        }
+    }
+
+    /* Mitigate memory leaks by releasing kernel allocated address nodes */
+    freeifaddrs(ifaddr_list);
+    return success;
+}

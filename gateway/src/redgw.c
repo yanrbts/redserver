@@ -284,6 +284,9 @@ static void load_config_file(void) {
         } else if (!strcasecmp(first, "device2")) {
             free(redserver.dev2);
             redserver.dev2 = zstrdup(second);
+        } else if (!strcasecmp(first, "ddevice")) {
+            free(redserver.ddev);
+            redserver.ddev = zstrdup(second);
         } else if (!strcasecmp(first, "coreip")) {
             free(redserver.core_ip);
             redserver.core_ip = zstrdup(second);
@@ -349,6 +352,7 @@ static void init_server_config(void) {
     redserver.dev2 = NULL;
     redserver.dev1_index = 0;
     redserver.dev2_index = 0;
+    redserver.ddev = NULL;
 
     redserver.core_ip = NULL;
     redserver.core_port = 0;
@@ -468,6 +472,8 @@ void server_cleanup() {
     free(redserver.logfile);
     free(redserver.gw_host);
     free(redserver.dev1);
+    free(redserver.dev2);
+    free(redserver.ddev);
     free(redserver.auth_ip);
     free(redserver.core_ip);
 

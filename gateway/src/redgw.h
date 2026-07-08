@@ -33,6 +33,7 @@ struct redgwserver {
     int dev1_index;             /* Cached ifindex for dev1 */
     char *dev2;                 /* Network interface to bind for raw socket */
     int dev2_index;             /* Cached ifindex for dev2 */
+    char *ddev;                 /* Network interface to bind for debug */
     char *core_ip;              /* Core UDP server IP */
     int core_port;              /* Core UDP server port */
     char *auth_ip;              /* Auth server IP */

@@ -56,8 +56,9 @@ static cmd_engine_t cmdengine = {
 static struct timespec g_start_ts;
 static struct {
     bool pcap_inited;
-    bool iseth1;
-} g_cap_inited = {false, false};
+    pthread_rwlock_t rwlock; /* Protects filter_expr */
+    char ifname[64];
+} g_cap_inited = {false, PTHREAD_RWLOCK_INITIALIZER, {0}};
 
 static int cmd_set_islogptk(void *ctx, int argc, char **argv, cmd_resp_t *resp);
 static int cmd_set_isdebug(void *ctx, int argc, char **argv, cmd_resp_t *resp);
@@ -412,7 +413,7 @@ static int cmd_set_auth(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
  * @param[in]  max_len   The absolute byte capacity of the destination buffer.
  * @return true if the filename was generated and fitted successfully without truncation; otherwise false.
  */
-static inline bool cmd_pcapfile_path(char *out_buf, size_t max_len) {
+static inline bool cmd_pcapfile_path(const char *dev, char *out_buf, size_t max_len) {
     // Defensive engineering: Reject null references or insufficient descriptors immediately
     if (!out_buf || max_len == 0) {
         return false;
@@ -439,7 +440,7 @@ static inline bool cmd_pcapfile_path(char *out_buf, size_t max_len) {
 
     // Securely encapsulate token with the directory path and format extensions
     // snprintf returns total bytes written excluding null terminator. If >= max_len, truncation occurred.
-    int written = snprintf(out_buf, max_len, "./%s.pcap", time_str);
+    int written = snprintf(out_buf, max_len, "./%s_%s.pcap", dev, time_str);
     
     if (written < 0 || (size_t)written >= max_len) {
         out_buf[0] = '\0';
@@ -454,21 +455,32 @@ static inline void cmd_pcap_init(const char *eth) {
         return;
 
     char pcap_file[64];
-    const char *ifname = NULL;
-    if (strcasecmp(eth, "eth1") == 0) {
-        ifname = redserver.dev1;
-    } else {
-        ifname = redserver.dev2;
-    }
 
-    if (cmd_pcapfile_path(pcap_file, sizeof(pcap_file))) {
-        pcap_mod_init(ifname, pcap_file);
+    if (cmd_pcapfile_path(eth, pcap_file, sizeof(pcap_file))) {
+        pcap_mod_init(eth, pcap_file);
     } else {
-        pcap_mod_init(ifname, PCAP_DEFAULT_FILE);
+        pcap_mod_init(eth, PCAP_DEFAULT_FILE);
     }
     
     g_cap_inited.pcap_inited = true;
-    g_cap_inited.iseth1 = (strcasecmp(eth, "eth1") == 0);
+
+    pthread_rwlock_rdlock(&g_cap_inited.rwlock);
+    strncpy(g_cap_inited.ifname, eth, sizeof(g_cap_inited.ifname) - 1);
+    g_cap_inited.ifname[sizeof(g_cap_inited.ifname) - 1] = '\0';
+    pthread_rwlock_unlock(&g_cap_inited.rwlock);
+}
+
+static inline void cmd_pcap_clean() {
+    pcap_mod_free();
+    g_cap_inited.pcap_inited = false;
+
+    pthread_rwlock_rdlock(&g_cap_inited.rwlock);
+    memset(g_cap_inited.ifname, 0, sizeof(g_cap_inited.ifname));
+    pthread_rwlock_unlock(&g_cap_inited.rwlock);
+
+    pthread_rwlock_rdlock(&cmdengine.filter_lock);
+    memset(cmdengine.filter_expr, 0, sizeof(cmdengine.filter_expr));
+    pthread_rwlock_unlock(&cmdengine.filter_lock);
 }
 
 static int cmd_pcap_filter(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
@@ -483,22 +495,15 @@ static int cmd_pcap_filter(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
         return -1;
     }
 
-    if (strcasecmp(argv[2], "eth1") != 0 && strcasecmp(argv[2], "eth2") != 0) {
-        cmd_resp_red(resp, "ERR: Invalid interface '%s'. Expected: eth1 or eth2.", argv[2]);
+    if (strcasecmp(argv[2], redserver.dev1) !=0 && strcasecmp(argv[2], redserver.dev2) != 0) {
+        cmd_resp_red(resp, "ERR: Invalid interface '%s'. Expected: %s or %s.", argv[2], redserver.dev1, redserver.dev2);
         return -1;
     }
 
     if (g_cap_inited.pcap_inited) {
-        if (g_cap_inited.iseth1) {
-            if (strcasecmp(argv[2], "eth1") != 0) {
-                cmd_resp_red(resp, "ERR: PCAP is already initialized on eth1. Please stop it before starting on eth2.");
-                return -1;
-            }
-        } else {
-            if (strcasecmp(argv[2], "eth2") != 0) {
-                cmd_resp_red(resp, "ERR: PCAP is already initialized on eth2. Please stop it before starting on eth1.");
-                return -1;
-            }
+        if (g_cap_inited.ifname[0] != '\0' && strcasecmp(argv[2], g_cap_inited.ifname) != 0) {
+            cmd_resp_red(resp, "ERR: PCAP is already initialized on %s. Please stop it before starting on %s.", g_cap_inited.ifname, argv[2]);
+            return -1;
         }
     }
 
@@ -549,8 +554,8 @@ static int cmd_pcap_capture(void *ctx, int argc, char **argv, cmd_resp_t *resp) 
         return -1;
     }
 
-    if (strcasecmp(argv[2], "eth1") !=0 && strcasecmp(argv[2], "eth2") != 0) {
-        cmd_resp_red(resp, "ERR: Invalid interface '%s'. Expected: eth1 or eth2.", argv[2]);
+    if (strcasecmp(argv[2], redserver.dev1) !=0 && strcasecmp(argv[2], redserver.dev2) != 0) {
+        cmd_resp_red(resp, "ERR: Invalid interface '%s'. Expected: %s or %s.", argv[2], redserver.dev1, redserver.dev2);
         return -1;
     }
 
@@ -571,16 +576,9 @@ static int cmd_pcap_capture(void *ctx, int argc, char **argv, cmd_resp_t *resp) 
     }
 
     if (g_cap_inited.pcap_inited) {
-        if (g_cap_inited.iseth1) {
-            if (strcasecmp(argv[2], "eth1") != 0) {
-                cmd_resp_red(resp, "ERR: PCAP is already initialized on eth1. Please stop it before starting on eth2.");
-                return -1;
-            }
-        } else {
-            if (strcasecmp(argv[2], "eth2") != 0) {
-                cmd_resp_red(resp, "ERR: PCAP is already initialized on eth2. Please stop it before starting on eth1.");
-                return -1;
-            }
+        if (g_cap_inited.ifname[0] != '\0' && strcasecmp(argv[2], g_cap_inited.ifname) != 0) {
+            cmd_resp_red(resp, "ERR: PCAP is already initialized on %s. Please stop it before starting on %s.", g_cap_inited.ifname, argv[2]);
+            return -1;
         }
     }
 
@@ -622,14 +620,7 @@ static int cmd_pcap_capture(void *ctx, int argc, char **argv, cmd_resp_t *resp) 
 
     
     if (!enable && g_cap_inited.pcap_inited) {
-        pcap_mod_free();
-        g_cap_inited.pcap_inited = false;
-        g_cap_inited.iseth1 = false;
-
-        pthread_rwlock_rdlock(&cmdengine.filter_lock);
-        memset(engine->filter_expr, 0, sizeof(engine->filter_expr));
-        pthread_rwlock_unlock(&cmdengine.filter_lock);
-
+        cmd_pcap_clean();
         is_normal_stop = true;
     }
 
@@ -877,7 +868,7 @@ static int cmd_get_config(void *ctx, int argc, char **argv, cmd_resp_t *resp) {
     cmd_resp_printf(resp, "  %s%-20s%s : %s%s%s%s(%s)%s\n", 
                     C_GREEN, "capture", C_RESET, 
                     C_YELLOW, cmd_ispcap_enabled() ? "on" : "off", C_RESET,
-                    C_GRAY, cmd_ispcap_enabled() ? (g_cap_inited.iseth1 ? "eth1" : "eth2") : "none",
+                    C_GRAY, cmd_ispcap_enabled() ? (g_cap_inited.ifname[0] != '\0' ? g_cap_inited.ifname : "none") : "none",
                     C_RESET);
 
     return 0;
@@ -985,8 +976,8 @@ bool cmd_ispcap_enabled(void) {
     return atomic_load(&cmdengine.ispcap);
 }
 
-bool cmd_iseth1_enabled(void) {
-    return g_cap_inited.pcap_inited ? g_cap_inited.iseth1 ? true : false : true;
+const char *cmd_get_current_eth(void) {
+    return g_cap_inited.ifname[0] != '\0' ? g_cap_inited.ifname : redserver.dev1;
 }
 
 int cmd_get_pcap_filter_safe(char *buf, size_t max_len) {
@@ -1003,16 +994,6 @@ int cmd_get_pcap_filter_safe(char *buf, size_t max_len) {
     return len;
 }
 
-static inline void cmd_pcap_clean() {
-    pcap_mod_free();
-    g_cap_inited.pcap_inited = false;
-    g_cap_inited.iseth1 = false;
-
-    pthread_rwlock_rdlock(&cmdengine.filter_lock);
-    memset(cmdengine.filter_expr, 0, sizeof(cmdengine.filter_expr));
-    pthread_rwlock_unlock(&cmdengine.filter_lock);
-}
-
 void cmd_setpcap_enabled(bool enabled, const char *ifname, const char *filter) {
     if (!ifname) return;
 
@@ -1024,16 +1005,9 @@ void cmd_setpcap_enabled(bool enabled, const char *ifname, const char *filter) {
     }
 
     if (g_cap_inited.pcap_inited) {
-        if (g_cap_inited.iseth1) {
-            if (strcasecmp(ifname, "eth1") != 0) {
-                log_warn("PCAP is already initialized on eth1. Please stop it before starting on eth2.");
-                cmd_pcap_clean();
-            }
-        } else {
-            if (strcasecmp(ifname, "eth2") != 0) {
-                log_warn("PCAP is already initialized on eth2. Please stop it before starting on eth1.");
-                cmd_pcap_clean();
-            }
+        if (strcasecmp(ifname, g_cap_inited.ifname) != 0) {
+            log_warn("PCAP is already initialized on %s. stop it before starting on %s.", g_cap_inited.ifname, ifname);
+            cmd_pcap_clean();
         }
     }
 
