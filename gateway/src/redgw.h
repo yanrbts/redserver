@@ -12,6 +12,8 @@
 #include <signal.h>
 
 #include "udp.h"
+#include "authx.h"
+
 #define CONFIG_DEFAULT_FILE                 "./config.conf"
 #define CONFIG_DEFAULT_PID_FILE             "/var/run/redgw.pid"
 #define CONFIG_READ_LEN                     1024
@@ -36,14 +38,15 @@ struct redgwserver {
     char *ddev;                 /* Network interface to bind for debug */
     char *core_ip;              /* Core UDP server IP */
     int core_port;              /* Core UDP server port */
-    char *auth_ip;              /* Auth server IP */
-    int auth_port;              /* Auth server port */
+    
     uint32_t auth_token;        /* Authentication token for core communication */
 
     void *handle;
     udp_conn_t *udpconn;        /* udp connect fd */
     raw_sock_t *rawconn;        /* raw udp conn */
     pthread_t cmd_tid;          /* cmd server thread id */
+
+    auth_ctx_t authctx;         /* Authentication context */
 };
 
 extern struct redgwserver redserver;

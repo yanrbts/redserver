@@ -29,6 +29,7 @@
 #include <ctype.h>
 #include <signal.h>
 #include <limits.h>
+#include <stdatomic.h>
 
 #include "util.h"
 #include "log.h"
@@ -44,108 +45,6 @@
 #define SYSCTL_PATH_MAX 256
 
 struct redgwserver redserver; /* Global server config */
-
-/**
- * @brief Safely writes a configuration value to a specified sysctl kernel parameter file.
- * @details Handles system call interruptions (EINTR) and prevents file descriptor leaks 
- * via O_CLOEXEC flags. Employs defensive programming for production safety.
- * @param path The absolute hardware path under /proc/sys/
- * @param value The configuration string to write (e.g., "1", "2")
- * @return 0 on success, -1 on absolute failure.
- */
-static int sysctl_write_value(const char *path, const char *value) {
-    if (!path || !value) {
-        return -1;
-    }
-
-    /* O_CLOEXEC is mandatory in industrial software to prevent FD leaks over exec() */
-    int fd = open(path, O_WRONLY | O_CLOEXEC);
-    if (fd < 0) {
-        /* Intentionally muted log; failure might be caused by missing root privileges */
-        return -1; 
-    }
-
-    char buf[16];
-    /* Appending '\n' ensures the kernel standard parser flushes correctly */
-    int len = snprintf(buf, sizeof(buf), "%s\n", value);
-    if (len >= (int)sizeof(buf) || len < 0) {
-        close(fd);
-        return -1;
-    }
-
-    const char *ptr = buf;
-    size_t remaining = (size_t)len;
-    ssize_t written;
-
-    /* Defensive loop to handle partial writes and EINTR (signal interruptions) */
-    while (remaining > 0) {
-        written = write(fd, ptr, remaining);
-        if (written < 0) {
-            if (errno == EINTR) {
-                continue; /* Interrupted by signal, retry immediately */
-            }
-            close(fd);
-            return -1; /* Real write error occurred */
-        }
-        ptr += written;
-        remaining -= (size_t)written;
-    }
-
-    /* close() can also be interrupted by EINTR; loop ensures complete resource release */
-    while (close(fd) < 0) {
-        if (errno != EINTR) {
-            return -1;
-        }
-    }
-
-    return 0;
-}
-
-/**
- * @brief Configures interface-specific ARP isolation settings to eliminate ARP Flux.
- * @note Forces arp_ignore=1 and arp_announce=2 on the target interface.
- * @param ifname Target network interface descriptor (e.g., "ens33", "ens37")
- * @return 0 on success, -1 on infrastructure failure.
- */
-static int net_tune_arp_isolation(const char *ifname) {
-    if (!ifname || strlen(ifname) == 0 || strlen(ifname) > 64) {
-        return -1;
-    }
-
-    char path_ignore[SYSCTL_PATH_MAX];
-    char path_announce[SYSCTL_PATH_MAX];
-
-    /* Format safe network path configurations for the specific interface */
-    if (snprintf(path_ignore, sizeof(path_ignore), "/proc/sys/net/ipv4/conf/%s/arp_ignore", ifname) >= (int)sizeof(path_ignore)) {
-        return -1;
-    }
-    if (snprintf(path_announce, sizeof(path_announce), "/proc/sys/net/ipv4/conf/%s/arp_announce", ifname) >= (int)sizeof(path_announce)) {
-        return -1;
-    }
-
-    /* Force inject strict filter rules into kernel memory map */
-    if (sysctl_write_value(path_ignore, "1") < 0) {
-        return -1;
-    }
-    if (sysctl_write_value(path_announce, "2") < 0) {
-        return -1;
-    }
-
-    return 0;
-}
-
-/**
- * @brief Automatically configures global and default fallback network routing parameters.
- * @details Establishes a system-wide baseline for multi-homed network setups.
- * @return 0 on success, -1 if the system denies operation.
- */
-static int net_tune_arp_global(void) {
-    if (sysctl_write_value("/proc/sys/net/ipv4/conf/all/arp_ignore", "1") < 0) return -1;
-    if (sysctl_write_value("/proc/sys/net/ipv4/conf/all/arp_announce", "2") < 0) return -1;
-    if (sysctl_write_value("/proc/sys/net/ipv4/conf/default/arp_ignore", "1") < 0) return -1;
-    if (sysctl_write_value("/proc/sys/net/ipv4/conf/default/arp_announce", "2") < 0) return -1;
-    return 0;
-}
 
 static char *zstrdup(const char *s) {
     size_t l = strlen(s)+1;
@@ -296,12 +195,19 @@ static void load_config_file(void) {
                 err = "Invalid CORE UDP port"; goto loaderr;
             }
         } else if (!strcasecmp(first, "authip")) {
-            free(redserver.auth_ip);
-            redserver.auth_ip = zstrdup(second);
+            free(redserver.authctx.auth_ip);
+            redserver.authctx.auth_ip = zstrdup(second);
         } else if (!strcasecmp(first, "authport")) {
-            redserver.auth_port = atoi(second);
-            if (redserver.auth_port < 0 || redserver.auth_port > 65535) {
+            redserver.authctx.auth_port = atoi(second);
+            if (redserver.authctx.auth_port < 0 || redserver.authctx.auth_port > 65535) {
                 err = "Invalid AUTH UDP port"; goto loaderr;
+            }
+        } else if (!strcasecmp(first, "authrefreshtime")) {
+            redserver.authctx.auth_interval = atoi(second);
+            if (redserver.authctx.auth_interval < AUTH_MIN_REFRESH_TIME 
+                || redserver.authctx.auth_interval > AUTH_MAX_REFRESH_TIME) {
+                err = "Invalid AUTH refresh time, between 5 to 10 minutes.";
+                goto loaderr;
             }
         } else if (!strcasecmp(first, "logfile")) {
             memset(tmp, 0, sizeof(tmp));
@@ -356,9 +262,18 @@ static void init_server_config(void) {
 
     redserver.core_ip = NULL;
     redserver.core_port = 0;
-    redserver.auth_ip = NULL;
-    redserver.auth_port = 0;
-    redserver.auth_token = 1;
+
+    redserver.authctx.auth_ip = NULL;
+    redserver.authctx.auth_port = 0;
+    redserver.authctx.conn = NULL;
+    redserver.authctx.auth_tid = 0;
+    redserver.authctx.is_alive = false;
+    redserver.authctx.running = false;
+    redserver.authctx.fail_count = 0;
+    redserver.authctx.auth_interval = AUTH_MIN_REFRESH_TIME;
+    redserver.authctx.last_auth_update = 0;
+    pthread_mutex_init(&redserver.authctx.state_lock, NULL);
+
     redserver.handle = NULL;
     redserver.udpconn = NULL;
     redserver.rawconn = NULL;
@@ -415,16 +330,6 @@ static void init_server(void) {
 
     log_info("Initializing kernel network stack tuning for multi-NIC environment...");
     
-    // if (net_tune_arp_global() < 0 || 
-    //     net_tune_arp_isolation(iface_black) < 0 || 
-    //     net_tune_arp_isolation(iface_client) < 0) {
-        
-    //     log_warn("Tuning kernel ARP settings failed, maybe file system is read-only.");
-    //     exit(1);
-    // } else {
-    //     log_info("Kernel ARP isolation successfully initialized: [%s] & [%s] are now isolated.", 
-    //              iface_black, iface_client);
-    // }
 
     redserver.dev1_index = (int)if_nametoindex(iface_black);
     redserver.dev2_index = (int)if_nametoindex(iface_client);
@@ -457,6 +362,12 @@ static void init_server(void) {
 
     if (wbs_notify_thread(1000) != 0) {
         log_error("Failed to inject telemetry thread!\n");
+        exit(1);
+    }
+
+    if (auth_monitor_start(&redserver.authctx) != 0) {
+        log_error("Failed to start authentication monitor thread!\n");
+        exit(1);
     }
 }
 
@@ -474,9 +385,10 @@ void server_cleanup() {
     free(redserver.dev1);
     free(redserver.dev2);
     free(redserver.ddev);
-    free(redserver.auth_ip);
     free(redserver.core_ip);
 
+    auth_monitor_stop(&redserver.authctx);
+    cmd_server_stop(&redserver.cmd_tid);
     xdp_receiver_stop(&redserver.handle);
     udp_close(redserver.udpconn);
     raw_sock_close(redserver.rawconn);

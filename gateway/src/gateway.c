@@ -20,6 +20,7 @@
 #include "gateway.h"
 #include "redgw.h"
 #include "cmdengine.h"
+#include "authx.h"
 
 #define OMNI_POOL_SIZE      (512 * 1024)    /* 512KB Per-Thread Dedicated High-Speed Raw Memory Core */
 
@@ -267,12 +268,13 @@ ssize_t gw_send_to_core(const uint8_t *data, size_t len) {
      * `omni_alloc`), this offset decrement will cause out-of-bounds corruption or SIGSEGV.
      */
     uint8_t *buf = (uint8_t*)data - HDR_SIZE;
+    uint32_t auth = auth_get_value();
 
     size_t packed_len = gw_pack(buf,
                             data, 
                             len, 
                             AUTH_DATA,           // Converted internally to big-endian
-                            redserver.auth_token // Converted internally to big-endian
+                            auth                 // Converted internally to big-endian
                         );
 
     if (unlikely(packed_len == 0)) {
