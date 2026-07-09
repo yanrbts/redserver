@@ -18,7 +18,6 @@ import asyncio
 from datetime import datetime
 from twisted.internet.protocol import DatagramProtocol
 from twisted.internet import reactor
-from art import text2art
 
 from rich.console import Console
 from rich.panel import Panel
@@ -88,23 +87,31 @@ def generate_dashboard():
     # -------------------------------------------------------------------------
     # Panel 1: Top Panel (System Profile Metrics)
     # -------------------------------------------------------------------------
-    sys_table = Table.grid(padding=(0, 4))
-    sys_table.add_column(style="bold cyan")
-    sys_table.add_column(style="white")
-    sys_table.add_column(style="bold cyan")
-    sys_table.add_column(style="white")
-    sys_table.add_column(style="bold magenta")
-    sys_table.add_column(style="bold green")
+    current_time_str = datetime.now().strftime("%H:%M:%S")
+    sys_table = Table.grid(padding=(0, 4), expand=True)
     
+    # 严格定义 6 列的样式与对齐规则
+    sys_table.add_column(style="bold cyan", justify="left")      # 1. DATA NODE: 标签
+    sys_table.add_column(style="white", justify="left")          # 2. DATA NODE 实际值
+    sys_table.add_column(style="bold cyan", justify="left")      # 3. TOTAL PKTS: 标签
+    sys_table.add_column(style="white", justify="left")          # 4. TOTAL PKTS 实际值
+    sys_table.add_column(style="bold magenta", justify="left", ratio=1) # 5. AUTH CORE VALUE (给 ratio=1 吸收剩余空间推动时间靠右)
+    sys_table.add_column(style="bold green", justify="right")    # 6. 🌟 时间列，强制右对齐
+
+    # 🌟 核心修正：精准填充 6 个参数，让时间完美落入第 6 列
     sys_table.add_row(
         "DATA NODE:", f"0.0.0.0:{DATA_BIND_PORT}", 
         "TOTAL PKTS:", f"{state.total_packets}",
-        "AUTH CORE VALUE:", f"0x{state.current_auth_value:08X}"
+        f"AUTH CORE VALUE: 0x{state.current_auth_value:08X}",  # 合并标签与值，独占第 5 列并展开
+        f"[bold white on grey15] 🕒 {current_time_str} [/bold white on grey15]" # 顺利进入第 6 列右对齐
     )
+    
+    # 第二行：保持对齐，最后两列留空即可
     sys_table.add_row(
-        "AUTH NODE:", f"0.0.0.0:{AUTH_BIND_PORT}", 
-        "SYS RUNTIME ERROR:", f"[red]{state.system_error}[/red]",
-        "", ""
+        "AUTH NODE:", f"0.0.0.0:{AUTH_BIND_PORT}",
+        "SYS ERROR:", f"[red]{state.system_error}[/red]",
+        "", 
+        ""
     )
     
     top_panel = Panel(
