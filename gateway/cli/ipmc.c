@@ -15,7 +15,10 @@ typedef enum {
     CMD_TYPE_SW_VER,    /* 软件版本 (SW Version) */
     CMD_TYPE_HW_VER,    /* 硬件版本 (HW Version) */
     CMD_TYPE_SN,        /* 序列号 (SN) */
-    CMD_TYPE_TIME       /* 运行时间 (Time) */
+    CMD_TYPE_TIME,      /* 运行时间 (Time) */
+
+    CMD_TYPE_RACK,      /* 机架信息 (Rack Info) */
+    CMD_TYPE_UPGRADE,   /* 升级信息 (Upgrade Info) */
 } test_cmd_type_t;
 
 static volatile int g_running = 1;
@@ -42,6 +45,7 @@ static void print_usage(const char *prog_name) {
     printf("Usage: %s [OPTIONS]\n", prog_name);
     printf("Options:\n");
     printf("  -f <path>   Config file path (default: ./ljb.conf)\n");
+    printf("  -m <module> Module name ipmc/cpu (default: ipmc)\n");
     printf("  -c <cmd>    Command type to execute:\n");
     printf("              all     : Default mixed loop test\n");
     printf("              hb      : Send Heartbeat sync\n");
@@ -49,13 +53,15 @@ static void print_usage(const char *prog_name) {
     printf("              hw      : Get HW Version sync\n");
     printf("              sn      : Get Serial Number sync\n");
     printf("              tm      : Get Uptime/Time sync\n");
+    printf("              rk      : Get Rack Info sync\n");
+    printf("              up      : Get Upgrade Info sync\n");
     printf("  -n <count>  Repeat count (default: 0 = infinite loop)\n");
     printf("  -i <sec>    Interval seconds between requests (default: 1s)\n");
     printf("  -h          Show this help message\n\n");
     printf("Examples:\n");
     printf("  %s -f /etc/ljb.conf -c hw -n 1 # Custom config file\n", prog_name);
-    printf("  %s -c hw -n 1       # Request HW version once\n", prog_name);
-    printf("  %s -c sw -n 5 -i 2  # Request SW version 5 times with 2s interval\n", prog_name);
+    printf("  %s -c hw -n 1                  # Request HW version once\n", prog_name);
+    printf("  %s -c sw -n 5 -i 2             # Request SW version 5 times with 2s interval\n", prog_name);
 }
 
 static void do_cmd_hb(ljb_ctx_t *ctx) {
@@ -64,7 +70,7 @@ static void do_cmd_hb(ljb_ctx_t *ctx) {
     if (err == LJB_OK) {
         log_info("[IPMC] Heartbeat ACK received from CPU.");
     } else {
-        log_error("[IPMC] Heartbeat TIMEOUT or ERROR: %d", err);
+        log_error("[IPMC] Heartbeat TIMEOUT or ERROR: %s", ljb_strerror(err));
     }
 }
 
@@ -77,7 +83,7 @@ static void do_cmd_sw_ver(ljb_ctx_t *ctx) {
                  cpu_sw_ver.major, cpu_sw_ver.minor, cpu_sw_ver.revision, 
                  cpu_sw_ver.build, cpu_sw_ver.ymd);
     } else {
-        log_error("[IPMC] FAILED: get_sw_version_sync err=%d", err);
+        log_error("[IPMC] FAILED: get_sw_version_sync %s", ljb_strerror(err));
     }
 }
 
@@ -90,7 +96,7 @@ static void do_cmd_hw_ver(ljb_ctx_t *ctx) {
                  cpu_hw_ver.major, cpu_hw_ver.minor, cpu_hw_ver.revision, 
                  cpu_hw_ver.build, cpu_hw_ver.ymd);
     } else {
-        log_error("[IPMC] FAILED: get_hw_version_sync err=%d", err);
+        log_error("[IPMC] FAILED: get_hw_version_sync %s", ljb_strerror(err));
     }
 }
 
@@ -115,7 +121,7 @@ static void do_cmd_sn(ljb_ctx_t *ctx) {
 
         log_info("[IPMC] SUCCESS: SN (Hex): [ %s] | SN (ASCII): \"%s\"", sn_hex, sn_str);
     } else {
-        log_error("[IPMC] FAILED: get_sn_sync err=%d", err);
+        log_error("[IPMC] FAILED: get_sn_sync %s", ljb_strerror(err));
     }
 }
 
@@ -131,21 +137,58 @@ static void do_cmd_time(ljb_ctx_t *ctx) {
         log_info("[IPMC] TIME: Total Uptime: %" PRIu64 " half-hours, Current Uptime: %" PRIu64 " seconds", 
                  total_half_hours, uptime_sec);
     } else {
-        log_error("[IPMC] FAILED: get_time_sync err=%d", err);
+        log_error("[IPMC] FAILED: get_time_sync %s", ljb_strerror(err));
+    }
+}
+
+static void do_cmd_rack(ljb_ctx_t *ctx) {
+    log_info("[CPU] ---> Requesting Rack Info...");
+    ljb_rack_t rack_info;
+    ljb_err_t err = ljb_cpu_get_rack_info_sync(ctx, &rack_info);
+    if (err == LJB_OK) {
+        log_info("[CPU] SUCCESS: Rack ID: 0x%02X, Slot ID: 0x%02X", 
+            rack_info.rack_id, 
+            rack_info.slot_id
+        );
+    } else {
+        log_error("[CPU] FAILED: ljb_cpu_get_rack_info_sync %s", ljb_strerror(err));
+    }
+}
+
+static void do_cmd_upgrade(ljb_ctx_t *ctx) {
+    log_info("[CPU] ---> Requesting Upgrade...");
+    uint8_t upgrade = 0xFF;
+    ljb_err_t err = ljb_cpu_request_upgrade_sync(ctx, &upgrade);
+    if (err == LJB_OK) {
+        log_info("[CPU] SUCCESS: Upgrade Grant Response Code: 0x%02X", upgrade);
+    } else {
+        log_error("[CPU] FAILED: ljb_cpu_request_upgrade_sync %s", ljb_strerror(err));
     }
 }
 
 int main(int argc, char *argv[]) {
     test_cmd_type_t cmd_type = CMD_TYPE_ALL;
     const char *config_file = "./ljb.conf";
-    int target_count = 0;   /* 默认 0：无限循环 */
-    int interval_sec = 1;   /* 默认间隔 1 秒 */
+    ljb_node_t module_role = NODE_IPMC;     /* 默认模块角色为 IPMC */
+    int target_count = 0;                   /* 默认 0：无限循环 */
+    int interval_sec = 1;                   /* 默认间隔 1 秒 */
     int opt;
 
-    while ((opt = getopt(argc, argv, "f:c:n:i:h")) != -1) {
+    while ((opt = getopt(argc, argv, "f:m:c:n:i:h")) != -1) {
         switch (opt) {
             case 'f':
                 config_file = optarg;
+                break;
+            case 'm':
+                if (strcmp(optarg, "ipmc") == 0) {
+                    module_role = NODE_IPMC;
+                } else if (strcmp(optarg, "cpu") == 0) {
+                    module_role = NODE_CPU;
+                } else {
+                    log_error("Unknown module type: %s\n", optarg);
+                    print_usage(argv[0]);
+                    return 1;
+                }
                 break;
             case 'c':
                 if (strcmp(optarg, "hb") == 0) {
@@ -160,8 +203,12 @@ int main(int argc, char *argv[]) {
                     cmd_type = CMD_TYPE_TIME;
                 } else if (strcmp(optarg, "all") == 0) {
                     cmd_type = CMD_TYPE_ALL;
+                } else if (strcmp(optarg, "rk") == 0) {
+                    cmd_type = CMD_TYPE_RACK;
+                } else if (strcmp(optarg, "up") == 0) {
+                    cmd_type = CMD_TYPE_UPGRADE;
                 } else {
-                    log_error("[IPMC] Unknown command type: %s\n", optarg);
+                    log_error("Unknown command type: %s\n", optarg);
                     print_usage(argv[0]);
                     return 1;
                 }
@@ -185,25 +232,27 @@ int main(int argc, char *argv[]) {
 
     signal(SIGINT, sig_handler);
 
-    log_info("[IPMC] Initializing engine...");
-    if (ljb_init(&ctx, config_file, NODE_IPMC) != LJB_OK) {
-        log_error("[IPMC] Failed to initialize LJB engine");
+    log_info("[%s] Initializing engine...", module_role == NODE_IPMC ? "IPMC" : "CPU");
+    if (ljb_init(&ctx, config_file, module_role) != LJB_OK) {
+        log_error("[%s] Failed to initialize LJB engine", module_role == NODE_IPMC ? "IPMC" : "CPU");
         return 1;
     }
 
     sleep(1);
-    
-    log_info("[IPMC] Engine running (Cmd Mode: %d, Count: %d, Interval: %ds). Press Ctrl+C to stop.",
-             cmd_type, target_count, interval_sec);
+
+    log_info("[%s] Engine running (Cmd Mode: %d, Count: %d, Interval: %ds). Press Ctrl+C to stop.",
+             module_role == NODE_IPMC ? "IPMC" : "CPU", cmd_type, target_count, interval_sec);
 
     int loop_cnt = 1;
     while (g_running) {
         if (target_count > 0 && loop_cnt > target_count) {
-            log_info("[IPMC] Target count (%d) reached. Exiting loop.", target_count);
+            log_info("[%s] Target count (%d) reached. Exiting loop.", 
+                module_role == NODE_IPMC ? "IPMC" : "CPU", target_count);
             break;
         }
 
-        switch (cmd_type) {
+        if (module_role == NODE_IPMC) {
+            switch (cmd_type) {
             case CMD_TYPE_HB: do_cmd_hb(&ctx); break;
             case CMD_TYPE_SW_VER: do_cmd_sw_ver(&ctx); break;
             case CMD_TYPE_HW_VER: do_cmd_hw_ver(&ctx); break;
@@ -219,17 +268,27 @@ int main(int argc, char *argv[]) {
                 if (loop_cnt % 3 == 0) do_cmd_sn(&ctx);
                 if (loop_cnt % 4 == 0) do_cmd_time(&ctx);
                 break;
+            }
+        } else {
+            switch (cmd_type) {
+            case CMD_TYPE_RACK: do_cmd_rack(&ctx); break;
+            case CMD_TYPE_UPGRADE: do_cmd_upgrade(&ctx); break;
+            case CMD_TYPE_ALL:
+            default:
+                if (loop_cnt % 2 == 0) do_cmd_rack(&ctx);
+                if (loop_cnt % 4 == 0) do_cmd_upgrade(&ctx);
+                break;
+            }
         }
-
+        
         loop_cnt++;
-
         /* 按步长休眠，保证响应 Ctrl+C */
         for (int i = 0; i < interval_sec && g_running; ++i) {
             sleep(1);
         }
     }
 
-    log_info("[IPMC] Deinitializing...");
+    log_info("[%s] Deinitializing...", module_role == NODE_IPMC ? "IPMC" : "CPU");
     ljb_deinit(&ctx);
     return 0;
 }

@@ -8,7 +8,6 @@
 #include <stdbool.h>
 
 #define MAX_PACKET_DATA 2048
-#define TARGET_UDP_DST_PORT 52719
 
 #ifdef USE_PERF_BUFFER
 struct packet_metadata {
@@ -34,6 +33,21 @@ struct {
     __uint(max_entries, 1 << 24); 
 } pkt_ringbuf SEC(".maps");
 #endif
+
+/* 判断目标端口是否在抓取列表中 */
+static inline bool is_target_port(__u16 port) {
+    switch (port) {
+        case 52719:
+        case 58888:
+        case 59999:
+        case 50002:
+        case 60002:
+        case 6013:
+            return true;
+        default:
+            return false;
+    }
+}
 
 SEC("xdp")
 int xdp_packet_capture(struct xdp_md *ctx) {
@@ -69,7 +83,10 @@ int xdp_packet_capture(struct xdp_md *ctx) {
             if (!is_fragment) return XDP_PASS;
         } else {
             struct udphdr *udp = (void *)ip + ip_hdr_len;
-            if (bpf_ntohs(udp->dest) != TARGET_UDP_DST_PORT && !is_fragment) {
+            __u16 dst_port = bpf_ntohs(udp->dest);
+            
+            // 如果不是目标端口且不是分片报文，直接放行
+            if (!is_target_port(dst_port) && !is_fragment) {
                 return XDP_PASS;
             }
         }
