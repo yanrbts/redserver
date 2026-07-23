@@ -13,8 +13,10 @@
 
 #include "udp.h"
 #include "authx.h"
+#include "ljb.h"
 
 #define CONFIG_DEFAULT_FILE                 "./config.conf"
+#define CONFIG_DEFAULT_LJB_FILE             "./ljb.conf"
 #define CONFIG_DEFAULT_PID_FILE             "/var/run/redgw.pid"
 #define CONFIG_READ_LEN                     1024
 #define CONFIG_DEFAULT_HOST                 "0.0.0.0"
@@ -26,6 +28,7 @@ struct redgwserver {
     char *pidfile;              /* PID file path */
     char *configfile;           /* config file path */
     char *logfile;              /* Path of log file */
+    char *ljbconf;              /* Path of ljb config file */
     int daemonize;              /* True if running as a daemon */
 
     char *gw_host;              /* Gateway IP to bind */
@@ -47,6 +50,7 @@ struct redgwserver {
     pthread_t cmd_tid;          /* cmd server thread id */
 
     auth_ctx_t authctx;         /* Authentication context */
+    ljb_ctx_t ljb_ctx;          /* LJB engine context */
 };
 
 extern struct redgwserver redserver;

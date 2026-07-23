@@ -22,9 +22,8 @@ KERNEL_VERSION := $(shell uname -r)
 KERNEL_MAJOR   := $(shell uname -r | cut -d. -f1)
 
 # 默认编译基础参数
-CFLAGS   := -ggdb -O3 -DLOG_USE_COLOR -Wall -Wextra -pthread -Iinclude -Isrc -Isrc/ws
+CFLAGS   := -ggdb -O3 -DVALIDATE_UTF8 -DLOG_USE_COLOR -Wall -Wextra -pthread -Iinclude -Isrc -Isrc/ws
 BPFFLAGS := -O2 -target bpf -g -Wall
-# LDFLAGS  := -lpthread -lbpf -lelf -lz -lm -lpcap
 
 # 🌟 核心修改 1：追加 -L/lib64 和 -L/usr/lib64 强行让 GCC 链接器去麒麟的 64 位库路径下搜寻 .so 文件
 # 🌟 核心修改 2：追加 -Wl,-rpath 选项，把这些路径硬编码进生成的二进制文件中，这样运行时就不需要配 LD_LIBRARY_PATH 了！

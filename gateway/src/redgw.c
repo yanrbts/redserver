@@ -123,7 +123,7 @@ static char *getAbsolutePath(char *filename) {
 
 static void load_config_file(void) {
     FILE *fp;
-    FILE *logfp;
+    FILE *logfp, *ljbfp;
     char *err = NULL;
     char tmp[256] = {0};
     char buf[CONFIG_READ_LEN+1];
@@ -231,6 +231,20 @@ static void load_config_file(void) {
         } else if (!strcasecmp(first, "pidfile")) {
             free(redserver.pidfile);
             redserver.pidfile = zstrdup(second);
+        } else if (!strcasecmp(first, "ljbconf")) {
+            free(redserver.ljbconf);
+            redserver.ljbconf = zstrdup(second);
+            if (redserver.ljbconf[0] != '\0') {
+                /* Test if we are able to open the file. The server will not
+                 * be able to abort just for this problem later... */
+                ljbfp = fopen(redserver.ljbconf,"a");
+                if (ljbfp == NULL) {
+                    snprintf(tmp, sizeof(tmp), "Can't open the ljb config file: %s", strerror(errno));
+                    err = tmp;
+                    goto loaderr;
+                }
+                fclose(ljbfp);
+            }
         }
     }
     fclose(fp);
@@ -248,6 +262,7 @@ static void init_server_config(void) {
     redserver.umask = 027;
     redserver.pidfile = NULL;
     redserver.configfile = zstrdup(CONFIG_DEFAULT_FILE);
+    redserver.ljbconf = zstrdup(CONFIG_DEFAULT_LJB_FILE);
     redserver.logfile = NULL;
     redserver.daemonize = 0; // Default to daemonize
 
@@ -361,12 +376,17 @@ static void init_server(void) {
     xdp_reasm_init();
 
     if (wbs_notify_thread(1000) != 0) {
-        log_error("Failed to inject telemetry thread!\n");
+        log_error("Failed to inject telemetry thread!");
         exit(1);
     }
 
     if (auth_monitor_start(&redserver.authctx) != 0) {
-        log_error("Failed to start authentication monitor thread!\n");
+        log_error("Failed to start authentication monitor thread!");
+        exit(1);
+    }
+
+    if (ljb_init(&redserver.ljb_ctx, redserver.ljbconf, NODE_CPU) != LJB_OK) {
+        log_error("[IPMC] Failed to initialize LJB engine");
         exit(1);
     }
 }
@@ -394,6 +414,15 @@ void server_cleanup() {
     raw_sock_close(redserver.rawconn);
     wbs_stop();
 
+    /**
+     * Deinitialize the LJB engine and free the ljb configuration file.
+     * redserver.ljbconf is dynamically allocated, so we need to free it after deinitializing the LJB engine.
+     * LJB engine save uptime data to the ljb configuration file, 
+     * so we need to deinitialize the LJB engine before freeing the ljb configuration file.
+     */
+    ljb_deinit(&redserver.ljb_ctx);
+    free(redserver.ljbconf);
+
     log_info("Memory cleaned up successfully");
 }
 
@@ -412,6 +441,17 @@ static void usage(void) {
     exit(1);
 }
 
+static void get_rack_info(void) {
+    ljb_rack_t rack;
+
+    ljb_err_t err = ljb_cpu_get_rack_info_sync(&redserver.ljb_ctx, &rack);
+    if (err == LJB_OK) {
+        log_info("SUCCESS: IPMC Rack ID: 0x%02X, Slot ID: 0x%02X", 
+                rack.rack_id, rack.slot_id);
+    } else {
+        log_error("FAILED: ljb_cpu_get_rack_info_sync : %s", ljb_strerror(err));
+    }
+}
 
 int main(int argc, char *argv[]) {
     int j;
@@ -461,6 +501,8 @@ int main(int argc, char *argv[]) {
         createPidFile();
 
     init_server();
+
+    get_rack_info();
 
     int ret = xdp_receiver_start(redserver.handle);
     if (ret < 0) {
